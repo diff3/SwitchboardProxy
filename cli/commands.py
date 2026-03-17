@@ -1,5 +1,5 @@
 # cli/commands.py
-from utils.config_loader import ConfigLoader
+from shared.ConfigLoader import ConfigLoader
 
 def cmd_exit(state, args):
     return "__exit__", None

@@ -13,7 +13,7 @@ CONFIG = {
     "shared": {
         # Infrastructure settings (always applied)
         "buffer_size": 4096,
-        "log_file": "logs/traffic.log",
+        "log_file": "logs/proxy.log",
         "listen_host": "0.0.0.0",
     },
 

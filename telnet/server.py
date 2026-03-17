@@ -4,9 +4,9 @@ import socket
 import threading
 import logging
 
-from telnet.transport import TelnetIO
-from telnet.editor import LineEditor   # 👈 TELNET-editor
-from cli.repl import run_repl
+from proxy.telnet.transport import TelnetIO
+from proxy.telnet.editor import LineEditor   # 👈 TELNET-editor
+from proxy.cli.repl import run_repl
 
 LOGGER = logging.getLogger("proxy")
 

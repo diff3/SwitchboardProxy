@@ -1,4 +1,4 @@
-from cli.commands import COMMANDS
+from proxy.cli.commands import COMMANDS
 
 def complete(line: str):
     ends_with_space = line.endswith(" ")

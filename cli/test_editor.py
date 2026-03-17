@@ -1,6 +1,6 @@
-from cli.editor import LineEditor
-from cli.parser import parse_command, CommandError
-from cli.help import render_help
+from proxy.cli.editor import LineEditor
+from proxy.cli.parser import parse_command, CommandError
+from proxy.cli.help import render_help
 
 ed = LineEditor(completer=None)
 

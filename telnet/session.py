@@ -1,7 +1,7 @@
 # telnet/session.py
 
-from cli.parser import parse_command, CommandError
-from cli.help import render_help
+from proxy.cli.parser import parse_command, CommandError
+from proxy.cli.help import render_help
 
 
 class TelnetLineIO:

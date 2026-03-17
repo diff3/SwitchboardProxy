@@ -1,7 +1,7 @@
 # utils/config_loader.py
 
 from copy import deepcopy
-from config import CONFIG as DEFAULT_CONFIG
+from proxy.config import CONFIG as DEFAULT_CONFIG
 
 
 class ConfigLoader:

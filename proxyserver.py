@@ -21,11 +21,11 @@ from logging.handlers import RotatingFileHandler
 import logging
 import asyncio
 
-from utils.config_loader import ConfigLoader
-from state import SessionState, GlobalState
-from state_machine import update_state
-from adapters import apply_adapters
-from telnet.server import run_telnet_server
+from proxy.utils.config_loader import ConfigLoader
+from proxy.state import SessionState, GlobalState
+from proxy.state_machine import update_state
+from proxy.adapters import apply_adapters
+from proxy.telnet.server import run_telnet_server
 
 
 # ----------------------------------------------------------------------
