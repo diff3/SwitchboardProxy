@@ -1,4 +1,5 @@
-from proxy.cli.commands import COMMANDS
+from proxy.cli.commands import ROOT_COMMAND, resolve_effective_kind
+from proxy.cli.core import ParseContext, render_help as render_context_help
 
 
 class HelpError(Exception):
@@ -6,34 +7,29 @@ class HelpError(Exception):
 
 
 def get_node(path_tokens):
-    node = {"children": COMMANDS}
+    node = ROOT_COMMAND
     for tok in path_tokens:
-        children = node.get("children")
-        if not children or tok not in children:
+        child = node.children.get(tok)
+        if child is None:
             raise HelpError(f"Unknown command: {' '.join(path_tokens)}")
-        node = children[tok]
+        node = child
     return node
 
 
-def render_help(args):
-    """
-    args: list[str] after 'help'
-    returns: list[str] lines to print
-    """
+def _help_context(args):
     node = get_node(args)
+    return ParseContext(
+        command_path=list(args),
+        node=node,
+        parsed_args={},
+        active_arg=None,
+        current_prefix="",
+        ends_with_space=False,
+        tokens=list(args),
+        raw_args=[],
+        pending_args=list(node.args),
+    )
 
-    # If node has children → list them
-    children = node.get("children")
-    if children:
-        names = sorted(children.keys())
-        width = max(len(name) for name in names)
 
-        lines = []
-        for name in names:
-            desc = children[name].get("help", "")
-            lines.append(f"{name.ljust(width)}  {desc}")
-        return lines
-
-    # Leaf node → show its help
-    desc = node.get("help", "")
-    return [desc] if desc else []
+def render_help(args):
+    return render_context_help(ROOT_COMMAND, _help_context(args), resolve_effective_kind)

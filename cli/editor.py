@@ -158,13 +158,25 @@ class LineEditor:
                     continue
                 # TAB
                 if ch == "\t" and self.completer:
-                    text = "".join(self.buffer)
-                    matches = self.completer(text)
-
+                    before = "".join(self.buffer[:self.cursor])
                     base, prefix = self._split_tokens()
+                    matches = self.completer(before)
+
+                    if (
+                        len(matches) == 1
+                        and prefix
+                        and matches[0] == prefix
+                        and not before.endswith(" ")
+                    ):
+                        descended = self.completer(before + " ")
+                        if descended:
+                            base = before + " "
+                            prefix = ""
+                            matches = descended
 
                     if len(matches) == 1:
-                        completed = base + matches[0] + " "
+                        suffix = "" if matches[0].endswith(",") else " "
+                        completed = base + matches[0] + suffix
                         self._set_buffer(completed)
 
                     elif len(matches) > 1:

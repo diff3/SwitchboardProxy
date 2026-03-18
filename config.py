@@ -15,6 +15,36 @@ CONFIG = {
         "buffer_size": 4096,
         "log_file": "logs/proxy.log",
         "listen_host": "0.0.0.0",
+        "proxy": {
+            "adapters": {
+                "opcode_parser": True,
+                "decode": False,
+                "logging": True,
+            },
+            "logging": {
+                "mode": "opcode",
+                "raw_format": "hex",
+                "show_opcode": True,
+                "show_decoded": False,
+                "show_raw": False,
+                "show_raw_if_undecoded": True,
+                "max_raw_bytes": 256,
+            },
+            "filter": {
+                "whitelist": [],
+                "blacklist": [],
+            },
+            "capture": {
+                "dump": False,
+                "focus": [],
+            },
+            "phases": {
+                "auth": {},
+                "world": {},
+            },
+            "routes": {
+            },
+        },
     },
 
     "states": {
@@ -22,7 +52,7 @@ CONFIG = {
         "default": {
             "enable_log": True,
             "enable_view": True,
-            "enable_decode": False,
+            "enable_decode": True,
 
             "routes": {
                 "auth": {

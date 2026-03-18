@@ -1,7 +1,9 @@
 # telnet/session.py
 
-from proxy.cli.parser import parse_command, CommandError
+from proxy.cli.commands import ROOT_COMMAND, resolve_effective_kind
+from proxy.cli.core import render_help as render_context_help
 from proxy.cli.help import render_help
+from proxy.cli.parser import CommandError, IncompleteCommand, parse_command
 
 
 class TelnetLineIO:
@@ -47,6 +49,10 @@ class TelnetSession:
 
             try:
                 action, args = parse_command(line)
+            except IncompleteCommand as exc:
+                for row in render_context_help(ROOT_COMMAND, exc.ctx, resolve_effective_kind):
+                    self.io.write(row + "\n")
+                continue
             except CommandError as exc:
                 self.io.write(str(exc) + "\n")
                 continue

@@ -1,6 +1,8 @@
 from proxy.cli.editor import LineEditor
-from proxy.cli.parser import parse_command, CommandError
+from proxy.cli.commands import ROOT_COMMAND, resolve_effective_kind
+from proxy.cli.core import render_help as render_context_help
 from proxy.cli.help import render_help
+from proxy.cli.parser import CommandError, IncompleteCommand, parse_command
 
 ed = LineEditor(completer=None)
 
@@ -16,6 +18,10 @@ try:
 
         try:
             action, args = parse_command(line)
+        except IncompleteCommand as exc:
+            for row in render_context_help(ROOT_COMMAND, exc.ctx, resolve_effective_kind):
+                print(row)
+            continue
         except CommandError as exc:
             print(exc)
             continue

@@ -25,7 +25,9 @@ from proxy.utils.config_loader import ConfigLoader
 from proxy.state import SessionState, GlobalState
 from proxy.state_machine import update_state
 from proxy.adapters import apply_adapters
+from proxy.packet_adapters import apply_packet_adapters, configure_packet_adapters
 from proxy.telnet.server import run_telnet_server
+from proxy.utils.route_scope import route_phase, scoped_proxy_config
 
 
 # ----------------------------------------------------------------------
@@ -79,6 +81,39 @@ def setup_logging(log_file: str):
     LOGGER.addHandler(console_handler)
 
 
+def _proxy_logging_cfg() -> dict:
+    proxy_cfg = getattr(STATE, "proxy", None)
+    if isinstance(proxy_cfg, dict):
+        return proxy_cfg.get("logging") or {}
+    proxy_cfg = CONFIG.get("proxy") or {}
+    return proxy_cfg.get("logging") or {}
+
+
+def _proxy_route_cfg(route_name: str, phase: str | None = None) -> dict:
+    proxy_cfg = getattr(STATE, "proxy", None)
+    if not isinstance(proxy_cfg, dict):
+        proxy_cfg = CONFIG.get("proxy") or {}
+    if not phase:
+        phase = route_phase(route_name, STATE.routes.get(route_name) if isinstance(STATE.routes, dict) else None)
+    return scoped_proxy_config(proxy_cfg, phase=phase, route_name=route_name)
+
+
+def _format_stream_raw(data: bytes, route_name: str, phase: str | None = None) -> str:
+    logging_cfg = (_proxy_route_cfg(route_name, phase).get("logging") or {})
+    raw_format = str(logging_cfg.get("raw_format", "hex") or "hex").lower()
+    max_raw_bytes = int(
+        logging_cfg.get(
+            "max_raw_bytes",
+            logging_cfg.get("max_hex_bytes", 256),
+        )
+        or 256
+    )
+    sample = bytes(data[:max_raw_bytes])
+    if raw_format == "bytes":
+        return repr(sample)
+    return sample.hex()
+
+
 # ----------------------------------------------------------------------
 # Signal handling
 # ----------------------------------------------------------------------
@@ -99,31 +134,36 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 def log_tap(conn_id, client_addr, direction, data, state: SessionState):
     client_ip, client_port = client_addr
     LOGGER.info(
-        "conn=%s client=%s:%s phase=%s encrypted=%s %s %r",
+        "conn=%s client=%s:%s phase=%s encrypted=%s %s raw=%s",
         conn_id,
         client_ip,
         client_port,
         state.phase,
         state.encrypted,
         direction,
-        data,
+        _format_stream_raw(data, state.route_name, state.phase),
     )
 
 
 def view_tap(conn_id, client_addr, direction, data, state):
     LOGGER.info(
-        "conn=%s client=%s:%s phase=%s encrypted=%s %s %r",
+        "conn=%s client=%s:%s phase=%s encrypted=%s %s raw=%s",
         conn_id,
         client_addr[0],
         client_addr[1],
         state.phase,
         state.encrypted,
         direction,
-        data,
+        _format_stream_raw(data, state.route_name, state.phase),
     )
 
 
-def build_taps(state: GlobalState):
+def build_taps(state: GlobalState, route_name: str, phase: str = ""):
+    proxy_cfg = _proxy_route_cfg(route_name, phase)
+    adapters_cfg = proxy_cfg.get("adapters") or {}
+    if adapters_cfg.get("opcode_parser", False) and adapters_cfg.get("logging", False):
+        return ()
+
     taps = []
 
     if state.enable_log:
@@ -139,7 +179,7 @@ def build_taps(state: GlobalState):
 # Core pipe
 # ----------------------------------------------------------------------
 
-def pipe(source, destination, conn_id, client_addr, direction, taps, state):
+def pipe(source, destination, conn_id, client_addr, direction, state):
     while not SHUTDOWN_EVENT.is_set() and not state.shutdown:
         try:
             data = source.recv(CONFIG["buffer_size"])
@@ -149,12 +189,13 @@ def pipe(source, destination, conn_id, client_addr, direction, taps, state):
             break
 
         update_state(state, data, direction)
+        apply_packet_adapters(state, data, direction)
         data = apply_adapters(state, data, direction)
 
         if not data:
             continue
 
-        for tap in taps:
+        for tap in build_taps(STATE, state.route_name, state.phase):
             try:
                 tap(conn_id, client_addr, direction, data, state)
             except Exception as exc:
@@ -170,7 +211,7 @@ def pipe(source, destination, conn_id, client_addr, direction, taps, state):
 # Connection handler
 # ----------------------------------------------------------------------
 
-def handle_connection(client, client_addr, route, taps):
+def handle_connection(client, client_addr, route):
     if not CONNECTION_SEMAPHORE.acquire(blocking=False):
         client.close()
         return
@@ -197,6 +238,11 @@ def handle_connection(client, client_addr, route, taps):
     )
 
     state = SessionState()
+    state.route_name = route_name or ""
+    state.conn_id = conn_id
+    state.phase = route_phase(route_name, current_route) or state.phase
+    state.proxy = STATE.proxy
+    configure_packet_adapters(state, CONFIG, state.route_name, state.phase)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     try:
@@ -221,7 +267,6 @@ def handle_connection(client, client_addr, route, taps):
                     conn_id,
                     client_addr,
                     "IN ---> OUT",
-                    taps,
                     state,
                 ),
             ),
@@ -233,7 +278,6 @@ def handle_connection(client, client_addr, route, taps):
                     conn_id,
                     client_addr,
                     "OUT ---> IN",
-                    taps,
                     state,
                 ),
             ),
@@ -268,8 +312,6 @@ def run_route(cfg, route):
     listener.bind((cfg["listen_host"], route["listen"]))
     listener.listen(5)
 
-    taps = build_taps(STATE)
-
     LOGGER.info(
         "listening %s:%s -> %s:%s",
         cfg["listen_host"],
@@ -285,7 +327,7 @@ def run_route(cfg, route):
 
             threading.Thread(
                 target=handle_connection,
-                args=(client, client_addr, route, taps),
+                args=(client, client_addr, route),
             ).start()
 
         except socket.timeout:
@@ -305,12 +347,15 @@ def run():
     CONFIG = ConfigLoader.load_active_config("default")
 
     # PATCH: använd global STATE, skugga den inte
+    STATE.active_state = "default"
     STATE.routes = CONFIG["routes"]
+    STATE.proxy = CONFIG.setdefault("proxy", {})
 
     setup_logging(CONFIG["log_file"])
 
     for name, route in CONFIG["routes"].items():
         route["name"] = name
+        route["phase"] = route_phase(name, route)
         threading.Thread(
             target=run_route,
             args=(CONFIG, route),

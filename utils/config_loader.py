@@ -28,7 +28,10 @@ class ConfigLoader:
         # merge other top-level overrides (if any later)
         for key, value in override.items():
             if key != "routes":
-                cfg[key] = value
+                if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                    cfg[key] = ConfigLoader._merge_dicts(cfg[key], value)
+                else:
+                    cfg[key] = value
 
         return cfg
 

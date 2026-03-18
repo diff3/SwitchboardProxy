@@ -1,13 +1,15 @@
 # state_machine.py
 
+from proxy.utils.route_scope import route_phase
+
+
 def update_state(state, data, direction):
     """
     Inspect raw traffic and update session state.
     No side effects outside state.
     """
-    # Example placeholders
-    if state.phase == "auth" and b"WORLD" in data:
-        state.phase = "world"
+    _ = data
+    _ = direction
 
-    if not state.encrypted and b"CRYPTO_ON" in data:
-        state.encrypted = True
+    route_name = getattr(state, "route_name", "")
+    state.phase = route_phase(route_name) or getattr(state, "phase", "auth")

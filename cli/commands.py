@@ -1,5 +1,357 @@
 # cli/commands.py
-from shared.ConfigLoader import ConfigLoader
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+import re
+from pathlib import Path
+
+from proxy.cli.core import ArgSpec, CommandNode, ParseContext, register_arg_type
+from proxy.config import CONFIG as DEFAULT_CONFIG
+from proxy.utils.config_loader import ConfigLoader
+from proxy.utils.route_scope import route_phase, scoped_proxy_config
+from shared.PathUtils import get_captures_root, get_debug_root, get_def_root, get_json_root
+
+
+_PROXY_SETTING_TYPES = {
+    "adapters.opcode_parser": bool,
+    "adapters.decode": bool,
+    "adapters.logging": bool,
+    "logging.mode": str,
+    "logging.raw_format": str,
+    "logging.show_opcode": bool,
+    "logging.show_decoded": bool,
+    "logging.show_raw": bool,
+    "logging.show_raw_if_undecoded": bool,
+    "logging.max_raw_bytes": int,
+    "capture.dump": bool,
+    "capture.focus": list,
+    "filter.whitelist": list,
+    "filter.blacklist": list,
+}
+
+_PROXY_SETTING_CHOICES = {
+    "logging.mode": {"opcode", "decoded", "raw", "hex", "bytes", "auto"},
+    "logging.raw_format": {"hex", "bytes"},
+}
+_PROXY_PHASES = {"auth", "world"}
+_PROTOCOL_VIEW_TYPES = {"def", "debug", "json"}
+
+
+def _proxy_config(state) -> dict:
+    proxy_cfg = getattr(state, "proxy", None)
+    if proxy_cfg is None:
+        proxy_cfg = {}
+        state.proxy = proxy_cfg
+    return proxy_cfg
+
+
+def _active_state_name(state) -> str:
+    return str(getattr(state, "active_state", "default") or "default")
+
+
+def _active_config(state) -> dict:
+    return ConfigLoader.load_active_config(_active_state_name(state))
+
+
+def _proxy_scope_and_path(args):
+    if not args:
+        return "global", None, None
+    if args[0] == "route":
+        route_name = args[1] if len(args) > 1 else None
+        path = args[2] if len(args) > 2 else None
+        return "route", route_name, path
+    if args[0] in _PROXY_PHASES:
+        phase = args[0]
+        path = args[1] if len(args) > 1 else None
+        return "phase", phase, path
+    return "global", None, args[0]
+
+
+def _proxy_scope_label(scope: str, name: str | None) -> str:
+    if scope == "phase" and name:
+        return f"{name} "
+    if scope == "route" and name:
+        return f"route {name} "
+    return ""
+
+
+def _proxy_scope_config(state, scope: str, name: str | None) -> dict:
+    proxy_cfg = _proxy_config(state)
+    if scope == "global":
+        return proxy_cfg
+    if scope == "phase":
+        phases_cfg = proxy_cfg.setdefault("phases", {})
+        phase_cfg = phases_cfg.get(name)
+        if not isinstance(phase_cfg, dict):
+            phase_cfg = {}
+            phases_cfg[name] = phase_cfg
+        return phase_cfg
+    routes_cfg = proxy_cfg.setdefault("routes", {})
+    route_cfg = routes_cfg.get(name)
+    if not isinstance(route_cfg, dict):
+        route_cfg = {}
+        routes_cfg[name] = route_cfg
+    return route_cfg
+
+
+def _default_proxy_scope_config(state, scope: str, name: str | None) -> dict:
+    proxy_cfg = deepcopy(_active_config(state).get("proxy", {}))
+    if scope == "global":
+        return proxy_cfg
+    if scope == "phase":
+        phases_cfg = proxy_cfg.get("phases", {})
+        value = phases_cfg.get(name, {})
+        return deepcopy(value) if isinstance(value, dict) else {}
+    routes_cfg = proxy_cfg.get("routes", {})
+    value = routes_cfg.get(name, {})
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
+def _scope_args(args: list[str]) -> tuple[str, str | None, list[str]]:
+    if not args:
+        return "global", None, []
+    if args[0] == "route":
+        route_name = args[1] if len(args) > 1 else None
+        return "route", route_name, args[2:]
+    if args[0] in _PROXY_PHASES:
+        return "phase", args[0], args[1:]
+    return "global", None, args
+
+
+def _scope_display_name(scope: str, name: str | None) -> str:
+    if scope == "phase" and name:
+        return name
+    if scope == "route" and name:
+        return f"route {name}"
+    return "global"
+
+
+def _normalize_name_list(values) -> list[str]:
+    names = []
+    for value in values or []:
+        name = str(value).strip().upper()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _route_exists(state, route_name: str | None) -> bool:
+    return bool(route_name) and route_name in getattr(state, "routes", {})
+
+
+def _effective_scope_proxy_config(state, scope: str, name: str | None) -> dict:
+    proxy_cfg = _proxy_config(state)
+    if scope == "global":
+        return deepcopy(proxy_cfg)
+    if scope == "phase":
+        return scoped_proxy_config(proxy_cfg, phase=name)
+    route_cfg = getattr(state, "routes", {}).get(name, {})
+    phase = route_phase(name, route_cfg)
+    return scoped_proxy_config(proxy_cfg, phase=phase, route_name=name)
+
+
+def _joined_names(values) -> str:
+    items = _normalize_name_list(values)
+    return ",".join(items) if items else "<empty>"
+
+
+def _capture_focus_list(state, scope: str, name: str | None) -> list[str]:
+    try:
+        values = _get_nested_value(_proxy_scope_config(state, scope, name), "capture.focus")
+    except KeyError:
+        return []
+    return _normalize_name_list(values if isinstance(values, list) else [])
+
+
+def _parse_opcode_names(raw: str) -> list[str]:
+    normalized = str(raw or "").strip()
+    if not normalized:
+        return []
+    return _normalize_name_list(item for item in normalized.split(","))
+
+
+def _protocol_cases() -> list[str]:
+    names: set[str] = set()
+    for path in (get_def_root(), get_json_root(), get_debug_root()):
+        if not path.exists():
+            continue
+        for entry in path.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.suffix not in {".def", ".json"}:
+                continue
+            names.add(entry.stem)
+    return sorted(names)
+
+
+def _protocol_view_path(view_type: str, case_name: str) -> Path:
+    case_name = _normalize_capture_case_name(case_name)
+    if view_type == "def":
+        return get_def_root() / f"{case_name}.def"
+    if view_type == "json":
+        return get_json_root() / f"{case_name}.json"
+    return get_debug_root() / f"{case_name}.json"
+
+
+def _format_status_line(label: str, cfg: dict) -> str:
+    adapters_cfg = cfg.get("adapters") or {}
+    logging_cfg = cfg.get("logging") or {}
+    capture_cfg = cfg.get("capture") or {}
+    filter_cfg = cfg.get("filter") or {}
+    focus = _normalize_name_list(capture_cfg.get("focus", []))
+    whitelist = _normalize_name_list(filter_cfg.get("whitelist", []))
+    blacklist = _normalize_name_list(filter_cfg.get("blacklist", []))
+    return (
+        f"{label}: "
+        f"parser={'on' if adapters_cfg.get('opcode_parser', False) else 'off'} "
+        f"decode={'on' if adapters_cfg.get('decode', False) else 'off'} "
+        f"log={'on' if adapters_cfg.get('logging', False) else 'off'} "
+        f"mode={logging_cfg.get('mode', 'opcode')} "
+        f"raw={'on' if logging_cfg.get('show_raw', False) else 'off'} "
+        f"decoded={'on' if logging_cfg.get('show_decoded', False) else 'off'} "
+        f"dump={'on' if capture_cfg.get('dump', False) else 'off'} "
+        f"focus={len(focus)} "
+        f"whitelist={len(whitelist)} "
+        f"blacklist={len(blacklist)}"
+    )
+
+
+def _get_nested_value(data: dict, path: str):
+    current = data
+    for key in path.split("."):
+        if not isinstance(current, dict) or key not in current:
+            raise KeyError(path)
+        current = current[key]
+    return current
+
+
+def _set_nested_value(data: dict, path: str, value):
+    keys = path.split(".")
+    current = data
+    for key in keys[:-1]:
+        current = current.setdefault(key, {})
+    current[keys[-1]] = value
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "on", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "off", "no", "n"}:
+        return False
+    raise ValueError("expected boolean: on/off, true/false, yes/no, 1/0")
+
+
+def _parse_proxy_value(path: str, raw: str):
+    value_type = _PROXY_SETTING_TYPES[path]
+    if value_type is bool:
+        value = _parse_bool(raw)
+    elif value_type is int:
+        value = int(raw, 10)
+    elif value_type is list:
+        normalized = raw.strip()
+        if normalized.lower() in {"none", "off", "clear", "-"}:
+            value = []
+        else:
+            value = [
+                item.strip().upper()
+                for item in normalized.split(",")
+                if item.strip()
+            ]
+    else:
+        value = str(raw).strip().lower()
+
+    allowed = _PROXY_SETTING_CHOICES.get(path)
+    if allowed and value not in allowed:
+        raise ValueError(f"allowed values: {', '.join(sorted(allowed))}")
+
+    return value
+
+
+def _is_route(token: str, _parsed_args: dict[str, object]) -> bool:
+    return token in _PROXY_PHASES
+
+
+def _is_proxy_scope(token: str, _parsed_args: dict[str, object]) -> bool:
+    return token in _PROXY_PHASES or token == "route"
+
+
+def _is_route_name(token: str, parsed_args: dict[str, object]) -> bool:
+    return parsed_args.get("scope") == "route" and bool(str(token).strip())
+
+
+register_arg_type("route", accepts=_is_route)
+register_arg_type("proxy_scope", accepts=_is_proxy_scope)
+register_arg_type("route_name", accepts=_is_route_name)
+register_arg_type("state_name")
+register_arg_type("proxy_setting")
+register_arg_type("proxy_value")
+register_arg_type("bool")
+register_arg_type("command_path")
+register_arg_type("capture_name")
+register_arg_type("promoted_case")
+register_arg_type("protocol_view_type")
+
+
+_FOCUS_CAPTURE_SUFFIX_RE = re.compile(r"_(\d+)_(\d{4})$")
+
+
+def _capture_debug_dirs() -> list[Path]:
+    return [
+        get_captures_root() / "debug",
+        get_captures_root(focus=True) / "debug",
+    ]
+
+
+def _capture_json_dirs() -> list[Path]:
+    return [
+        get_captures_root() / "json",
+        get_captures_root(focus=True) / "json",
+    ]
+
+
+def _capture_file_candidates(name: str) -> list[Path]:
+    raw = str(name or "").strip()
+    if not raw:
+        return []
+    filename = raw if raw.endswith(".json") else f"{raw}.json"
+    candidates: list[Path] = []
+    for directory in _capture_debug_dirs():
+        candidates.append(directory / filename)
+    return candidates
+
+
+def _resolve_capture_debug_file(name: str) -> Path | None:
+    for candidate in _capture_file_candidates(name):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _normalize_capture_case_name(name: str) -> str:
+    stem = Path(str(name)).stem
+    return _FOCUS_CAPTURE_SUFFIX_RE.sub("", stem)
+
+
+def _promoted_paths(case_name: str) -> tuple[Path, Path, Path]:
+    base = _normalize_capture_case_name(case_name)
+    return (
+        get_def_root() / f"{base}.def",
+        get_json_root() / f"{base}.json",
+        get_debug_root() / f"{base}.json",
+    )
+
+
+def _write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
 
 def cmd_exit(state, args):
     return "__exit__", None
@@ -8,8 +360,10 @@ def cmd_exit(state, args):
 def cmd_clear(state, args):
     return "\x1b[2J\x1b[H", None
 
+
 def cmd_help(state, args):
     return "__help__", args
+
 
 def cmd_routes_show(state, args):
     lines = []
@@ -21,14 +375,15 @@ def cmd_routes_show(state, args):
         )
     return lines
 
+
 def cmd_state_list(state, args):
-    cfg = ConfigLoader.load_active_config("default")
-    states = cfg.get("states", {})
+    states = DEFAULT_CONFIG.get("states", {})
 
     if not states:
         return ["No states defined"]
 
     return ["states:"] + [f" - {name}" for name in sorted(states)]
+
 
 def cmd_state_use(state, args):
     if not args:
@@ -38,70 +393,752 @@ def cmd_state_use(state, args):
 
     try:
         cfg = ConfigLoader.load_active_config(name)
-    except Exception as exc:
+    except Exception:
         return [f"unknown state: {name}"]
 
-    # PATCH: uppdatera state in-place
     state.routes.clear()
     state.routes.update(cfg["routes"])
+    state.proxy.clear()
+    state.proxy.update(deepcopy(cfg.get("proxy", {})))
+    state.active_state = name
 
-    # uppdatera flaggor om de finns
     for key in ("enable_log", "enable_view", "enable_decode"):
         if key in cfg:
             setattr(state, key, cfg[key])
 
     return [f"state switched to '{name}'"]
 
+
 def cmd_state_show(state, args):
     lines = [
+        f"active_state  = {_active_state_name(state)}",
         f"shutdown     = {state.shutdown}",
     ]
 
-    # Visa flaggor om de finns
     for name in ("enable_log", "enable_view"):
         if hasattr(state, name):
             lines.append(f"{name:12} = {getattr(state, name)}")
 
     return lines
 
-COMMANDS = {
-    "help": {
-        "help": "Show help for commands",
-        "action": cmd_help,
-    },
-    "exit": {
-        "help": "Shut down the CLI",
-        "action": cmd_exit,
-    },
-    "clear": {
-        "help": "Clear the screen",
-        "action": cmd_clear,
-    },
-    "state": {
-        "help": "Inspect or modify state",
-        "children": {
-            "show": {
-                "help": "Show current state",
-                "action": cmd_state_show,
-            },
-            "use": {
-                "help": "Switch active state",
-                "action": cmd_state_use,
-            },
-            "list": {
-                "help": "List available states",
-                "action": cmd_state_list,
-            },
-        },
-    },
-    "routes": {
-        "help": "Inspect proxy routes",
-        "children": {
-            "show": {
-                "help": "Show active routes",
-                "action": cmd_routes_show,
-            },
-        },
-    },
 
-}
+def cmd_status(state, args):
+    scope, name, rest = _scope_args(args)
+    if scope == "route" and not name:
+        return ["usage: status [auth|world|route <name>]"]
+    if rest:
+        return ["usage: status [auth|world|route <name>]"]
+    if scope == "route" and not _route_exists(state, name):
+        return [f"unknown route: {name}"]
+
+    lines = [
+        f"state         = {_active_state_name(state)}",
+        f"routes        = {','.join(sorted(getattr(state, 'routes', {})))}",
+    ]
+
+    if scope == "global":
+        lines.append(_format_status_line("global", _effective_scope_proxy_config(state, "global", None)))
+        for phase in sorted(_PROXY_PHASES):
+            lines.append(_format_status_line(phase, _effective_scope_proxy_config(state, "phase", phase)))
+        for route_name in sorted(getattr(state, "routes", {})):
+            lines.append(
+                _format_status_line(
+                    f"route {route_name}",
+                    _effective_scope_proxy_config(state, "route", route_name),
+                )
+            )
+        return lines
+
+    label = _scope_display_name(scope, name)
+    cfg = _effective_scope_proxy_config(state, scope, name)
+    lines = [f"status ({label}):", _format_status_line(label, cfg)]
+    lines.append(f"focus        = {_joined_names((cfg.get('capture') or {}).get('focus', []))}")
+    lines.append(f"whitelist    = {_joined_names((cfg.get('filter') or {}).get('whitelist', []))}")
+    lines.append(f"blacklist    = {_joined_names((cfg.get('filter') or {}).get('blacklist', []))}")
+    return lines
+
+
+def cmd_proxy_show(state, args):
+    scope, name, path = _proxy_scope_and_path(args)
+    if scope == "route" and not name:
+        return ["usage: proxy show [auth|world|route <name>] [path]"]
+    proxy_cfg = _proxy_scope_config(state, scope, name)
+    paths = sorted(_PROXY_SETTING_TYPES.keys())
+    scope_label = _proxy_scope_label(scope, name)
+
+    if path:
+        if path not in _PROXY_SETTING_TYPES:
+            return [f"unknown proxy setting: {path}"]
+        try:
+            value = _get_nested_value(proxy_cfg, path)
+        except KeyError:
+            return [f"{scope_label}{path} = <unset>"]
+        if isinstance(value, list):
+            value = ",".join(value)
+        return [f"{scope_label}{path} = {value}"]
+
+    scope_name = name if scope != "global" else "global"
+    lines = [f"proxy settings ({scope_name}):"]
+    for path in paths:
+        try:
+            value = _get_nested_value(proxy_cfg, path)
+        except KeyError:
+            value = "<unset>"
+        if isinstance(value, list):
+            value = ",".join(value)
+        lines.append(f" - {path} = {value}")
+    return lines
+
+
+def cmd_proxy_get(state, args):
+    if not args:
+        return ["usage: proxy get [auth|world|route <name>] [path]"]
+    return cmd_proxy_show(state, args)
+
+
+def cmd_proxy_set(state, args):
+    if len(args) < 2:
+        return ["usage: proxy set [auth|world|route <name>] <path> <value>"]
+
+    scope = "global"
+    scope_name = None
+    path_index = 0
+    if args[0] == "route":
+        if len(args) < 4:
+            return ["usage: proxy set [auth|world|route <name>] <path> <value>"]
+        scope = "route"
+        scope_name = args[1]
+        path_index = 2
+    elif args[0] in _PROXY_PHASES:
+        if len(args) < 3:
+            return ["usage: proxy set [auth|world|route <name>] <path> <value>"]
+        scope = "phase"
+        scope_name = args[0]
+        path_index = 1
+
+    path = args[path_index]
+    raw_value = " ".join(args[path_index + 1:])
+
+    if path not in _PROXY_SETTING_TYPES:
+        return [f"unknown proxy setting: {path}"]
+
+    try:
+        value = _parse_proxy_value(path, raw_value)
+    except Exception as exc:
+        return [f"invalid value for {path}: {exc}"]
+
+    _set_nested_value(_proxy_scope_config(state, scope, scope_name), path, value)
+    prefix = _proxy_scope_label(scope, scope_name)
+    return [f"{prefix}{path} = {value}"]
+
+
+def cmd_reset(state, args):
+    scope, name, rest = _scope_args(args)
+    if scope == "route" and not name:
+        return ["usage: reset [auth|world|route <name>]"]
+    if rest:
+        return ["usage: reset [auth|world|route <name>]"]
+
+    cfg = _active_config(state)
+
+    if scope == "global":
+        state.routes.clear()
+        state.routes.update(cfg["routes"])
+        state.proxy.clear()
+        state.proxy.update(deepcopy(cfg.get("proxy", {})))
+        for key in ("enable_log", "enable_view", "enable_decode"):
+            if key in cfg:
+                setattr(state, key, cfg[key])
+        return [f"reset state '{_active_state_name(state)}' to config defaults"]
+
+    if scope == "route" and not _route_exists(state, name):
+        return [f"unknown route: {name}"]
+
+    target_cfg = _proxy_scope_config(state, scope, name)
+    default_cfg = _default_proxy_scope_config(state, scope, name)
+    target_cfg.clear()
+    target_cfg.update(default_cfg)
+    return [f"reset {_scope_display_name(scope, name)} proxy settings"]
+
+
+def cmd_focus_list(state, args):
+    scope, name, rest = _scope_args(args)
+    if scope == "route" and not name:
+        return ["usage: focus list [auth|world|route <name>]"]
+    if rest:
+        return ["usage: focus list [auth|world|route <name>]"]
+    if scope == "route" and not _route_exists(state, name):
+        return [f"unknown route: {name}"]
+
+    names = _capture_focus_list(state, scope, name)
+    label = _scope_display_name(scope, name)
+    return [f"focus ({label}) = {_joined_names(names)}"]
+
+
+def cmd_focus_clear(state, args):
+    scope, name, rest = _scope_args(args)
+    if scope == "route" and not name:
+        return ["usage: focus clear [auth|world|route <name>]"]
+    if rest:
+        return ["usage: focus clear [auth|world|route <name>]"]
+    if scope == "route" and not _route_exists(state, name):
+        return [f"unknown route: {name}"]
+
+    _set_nested_value(_proxy_scope_config(state, scope, name), "capture.focus", [])
+    return [f"cleared focus for {_scope_display_name(scope, name)}"]
+
+
+def _cmd_focus_update(state, args, *, remove: bool):
+    scope, name, rest = _scope_args(args)
+    action = "rm" if remove else "add"
+    if scope == "route" and not name:
+        return [f"usage: focus {action} [auth|world|route <name>] <opcode[,opcode...]>"]
+    if not rest:
+        return [f"usage: focus {action} [auth|world|route <name>] <opcode[,opcode...]>"]
+    if scope == "route" and not _route_exists(state, name):
+        return [f"unknown route: {name}"]
+
+    names = _parse_opcode_names(" ".join(rest))
+    if not names:
+        return ["missing opcode name"]
+
+    current = _capture_focus_list(state, scope, name)
+    if remove:
+        updated = [item for item in current if item not in names]
+    else:
+        updated = current[:]
+        for item in names:
+            if item not in updated:
+                updated.append(item)
+    _set_nested_value(_proxy_scope_config(state, scope, name), "capture.focus", updated)
+    return [f"focus ({_scope_display_name(scope, name)}) = {_joined_names(updated)}"]
+
+
+def cmd_focus_add(state, args):
+    return _cmd_focus_update(state, args, remove=False)
+
+
+def cmd_focus_rm(state, args):
+    return _cmd_focus_update(state, args, remove=True)
+
+
+def cmd_promote(state, args):
+    _ = state
+    if not args:
+        return ["usage: promote <capture-name>"]
+
+    source = _resolve_capture_debug_file(args[0])
+    if source is None:
+        return [f"missing capture debug: {args[0]}"]
+
+    case_name = _normalize_capture_case_name(source.name)
+    def_path, json_path, debug_path = _promoted_paths(case_name)
+
+    _write_text(def_path, "{}\n")
+    _write_json(json_path, {})
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    return [
+        f"promoted {source.name} -> {case_name}",
+        f"def   = {def_path.name}",
+        f"json  = {json_path.name}",
+        f"debug = {debug_path.name}",
+    ]
+
+
+def cmd_demote(state, args):
+    _ = state
+    if not args:
+        return ["usage: demote <case-name>"]
+
+    case_name = _normalize_capture_case_name(args[0])
+    removed: list[str] = []
+
+    for path in _promoted_paths(case_name):
+        if path.exists():
+            path.unlink()
+            removed.append(path.name)
+
+    if not removed:
+        return [f"nothing to demote for {case_name}"]
+
+    return [f"demoted {case_name}", *[f" - {name}" for name in removed]]
+
+
+def cmd_captures_clear(state, args):
+    _ = state
+    removed = 0
+    for directory in [*_capture_debug_dirs(), *_capture_json_dirs()]:
+        if not directory.exists():
+            continue
+        for entry in directory.iterdir():
+            if not entry.is_file():
+                continue
+            entry.unlink()
+            removed += 1
+    return [f"cleared captures: removed {removed} files"]
+
+
+def cmd_protocol_add(state, args):
+    return cmd_promote(state, args)
+
+
+def cmd_protocol_rm(state, args):
+    return cmd_demote(state, args)
+
+
+def cmd_protocol_list(state, args):
+    _ = state
+    if args:
+        return ["usage: protocol list"]
+    names = _protocol_cases()
+    if not names:
+        return ["no promoted protocol artifacts"]
+    return ["protocol artifacts:"] + [f" - {name}" for name in names]
+
+
+def cmd_protocol_sync(state, args):
+    _ = state
+    if args:
+        return ["usage: protocol sync"]
+
+    updated_debug = 0
+    updated_json = 0
+    lines: list[str] = []
+
+    for debug_path in sorted(get_debug_root().glob("*.json")):
+        case_name = debug_path.stem
+        capture_debug = get_captures_root() / "debug" / f"{case_name}.json"
+        capture_json = get_captures_root() / "json" / f"{case_name}.json"
+        target_json = get_json_root() / f"{case_name}.json"
+
+        if not capture_debug.exists():
+            lines.append(f"[SKIP] no capture debug for {case_name}")
+            continue
+
+        debug_path.write_bytes(capture_debug.read_bytes())
+        updated_debug += 1
+        lines.append(f"[OK] synced debug for {case_name}")
+
+        if capture_json.exists():
+            target_json.parent.mkdir(parents=True, exist_ok=True)
+            target_json.write_bytes(capture_json.read_bytes())
+            updated_json += 1
+            lines.append(f"[OK] synced json for {case_name}")
+        else:
+            lines.append(f"[SKIP] no capture json for {case_name}")
+
+    if not lines:
+        return ["no promoted debug artifacts to sync"]
+
+    lines.append(f"sync complete: debug={updated_debug} json={updated_json}")
+    return lines
+
+
+def cmd_protocol_view(state, args):
+    _ = state
+    if len(args) != 2:
+        return ["usage: protocol view <def|debug|json> <opcode>"]
+    view_type = str(args[0]).strip().lower()
+    if view_type not in _PROTOCOL_VIEW_TYPES:
+        return ["usage: protocol view <def|debug|json> <opcode>"]
+    path = _protocol_view_path(view_type, args[1])
+    if not path.exists():
+        return [f"missing {view_type}: {path.name}"]
+    return [f"{view_type} {path.name}:"] + path.read_text(encoding="utf-8").splitlines()
+
+
+def resolve_effective_kind(ctx: ParseContext) -> str | None:
+    if ctx.active_arg is None:
+        return None
+
+    if ctx.command_path == ["proxy", "set"] and ctx.active_arg.name == "value":
+        setting = ctx.parsed_args.get("setting")
+        if setting in {"filter.whitelist", "filter.blacklist", "capture.focus"}:
+            return "csv[opcode_name]"
+        if _PROXY_SETTING_TYPES.get(setting) is bool:
+            return "bool"
+        return "proxy_value"
+
+    if ctx.command_path[:2] in (["focus", "add"], ["focus", "rm"]) and ctx.active_arg.name == "opcode_names":
+        return "csv[opcode_name]"
+
+    if ctx.command_path and ctx.command_path[0] == "help":
+        return "command_path"
+
+    if ctx.command_path[:2] in (
+        ["proxy", "show"],
+        ["proxy", "get"],
+        ["proxy", "set"],
+    ):
+        if ctx.active_arg.name == "scope":
+            return "proxy_scope_or_setting"
+        if ctx.active_arg.name == "route_name":
+            return "route_name"
+
+    if ctx.command_path[:1] in (["status"], ["reset"]) or ctx.command_path[:2] in (
+        ["focus", "list"],
+        ["focus", "clear"],
+        ["focus", "add"],
+        ["focus", "rm"],
+    ):
+        if ctx.active_arg.name == "scope":
+            return "proxy_scope"
+        if ctx.active_arg.name == "route_name":
+            return "route_name"
+
+    if ctx.command_path[:2] == ["protocol", "view"] and ctx.active_arg.name == "view_type":
+        return "protocol_view_type"
+
+    return ctx.active_arg.kind
+
+
+def first_missing_context_arg(ctx: ParseContext) -> ArgSpec | None:
+    if ctx.parsed_args.get("scope") == "route" and "route_name" not in ctx.parsed_args:
+        for arg in ctx.node.args:
+            if arg.name == "route_name":
+                return arg
+    return None
+
+
+ROOT_COMMAND = CommandNode(
+    name="",
+    children={
+        "help": CommandNode(
+            name="help",
+            handler=cmd_help,
+            help="Show help for commands",
+            args=[
+                ArgSpec(
+                    name="path",
+                    kind="command_path",
+                    optional=True,
+                    help="command path",
+                    remainder=True,
+                )
+            ],
+        ),
+        "exit": CommandNode(
+            name="exit",
+            handler=cmd_exit,
+            help="Shut down the CLI",
+        ),
+        "quit": CommandNode(
+            name="quit",
+            handler=cmd_exit,
+            help="Shut down the CLI",
+        ),
+        "clear": CommandNode(
+            name="clear",
+            handler=cmd_clear,
+            help="Clear the screen",
+        ),
+        "status": CommandNode(
+            name="status",
+            handler=cmd_status,
+            help="Show compact proxy runtime status",
+            args=[
+                ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                ArgSpec(
+                    name="route_name",
+                    kind="route_name",
+                    optional=True,
+                    help="configured route name",
+                ),
+            ],
+        ),
+        "reset": CommandNode(
+            name="reset",
+            handler=cmd_reset,
+            help="Reset runtime settings to the active state's defaults",
+            args=[
+                ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                ArgSpec(
+                    name="route_name",
+                    kind="route_name",
+                    optional=True,
+                    help="configured route name",
+                ),
+            ],
+        ),
+        "state": CommandNode(
+            name="state",
+            help="Inspect or modify state",
+            children={
+                "show": CommandNode(
+                    name="show",
+                    handler=cmd_state_show,
+                    help="Show current state",
+                ),
+                "use": CommandNode(
+                    name="use",
+                    handler=cmd_state_use,
+                    help="Switch active state",
+                    args=[
+                        ArgSpec(
+                            name="state",
+                            kind="state_name",
+                            help="configured state name",
+                        )
+                    ],
+                ),
+                "list": CommandNode(
+                    name="list",
+                    handler=cmd_state_list,
+                    help="List available states",
+                ),
+            },
+        ),
+        "routes": CommandNode(
+            name="routes",
+            help="Inspect proxy routes",
+            children={
+                "show": CommandNode(
+                    name="show",
+                    handler=cmd_routes_show,
+                    help="Show active routes",
+                ),
+            },
+        ),
+        "promote": CommandNode(
+            name="promote",
+            handler=cmd_promote,
+            help="Promote a capture debug file into data/debug, data/json, and data/def",
+            args=[
+                ArgSpec(
+                    name="capture_name",
+                    kind="capture_name",
+                    help="capture debug file from captures/debug or captures/focus/debug",
+                )
+            ],
+        ),
+        "demote": CommandNode(
+            name="demote",
+            handler=cmd_demote,
+            help="Remove a promoted packet from data/debug, data/json, and data/def",
+            args=[
+                ArgSpec(
+                    name="case_name",
+                    kind="promoted_case",
+                    help="promoted opcode name",
+                )
+            ],
+        ),
+        "captures": CommandNode(
+            name="captures",
+            help="Manage packet captures",
+            children={
+                "clear": CommandNode(
+                    name="clear",
+                    handler=cmd_captures_clear,
+                    help="Remove all files under captures/json, captures/debug, and focus captures",
+                ),
+            },
+        ),
+        "focus": CommandNode(
+            name="focus",
+            help="Manage capture focus lists by scope",
+            children={
+                "list": CommandNode(
+                    name="list",
+                    handler=cmd_focus_list,
+                    help="Show the current focus list",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                    ],
+                ),
+                "clear": CommandNode(
+                    name="clear",
+                    handler=cmd_focus_clear,
+                    help="Clear the current focus list",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                    ],
+                ),
+                "add": CommandNode(
+                    name="add",
+                    handler=cmd_focus_add,
+                    help="Add one or more opcodes to the focus list",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                        ArgSpec(
+                            name="opcode_names",
+                            kind="csv[opcode_name]",
+                            help="comma-separated opcode names",
+                            remainder=True,
+                        ),
+                    ],
+                ),
+                "rm": CommandNode(
+                    name="rm",
+                    handler=cmd_focus_rm,
+                    help="Remove one or more opcodes from the focus list",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                        ArgSpec(
+                            name="opcode_names",
+                            kind="csv[opcode_name]",
+                            help="comma-separated opcode names",
+                            remainder=True,
+                        ),
+                    ],
+                ),
+            },
+        ),
+        "protocol": CommandNode(
+            name="protocol",
+            help="Inspect or modify promoted protocol artifacts",
+            children={
+                "add": CommandNode(
+                    name="add",
+                    handler=cmd_protocol_add,
+                    help="Promote a capture file into protocol artifacts",
+                    args=[
+                        ArgSpec(
+                            name="capture_name",
+                            kind="capture_name",
+                            help="capture debug file from captures/debug or captures/focus/debug",
+                        )
+                    ],
+                ),
+                "rm": CommandNode(
+                    name="rm",
+                    handler=cmd_protocol_rm,
+                    help="Remove promoted protocol artifacts",
+                    args=[
+                        ArgSpec(
+                            name="case_name",
+                            kind="promoted_case",
+                            help="promoted opcode name",
+                        )
+                    ],
+                ),
+                "list": CommandNode(
+                    name="list",
+                    handler=cmd_protocol_list,
+                    help="List promoted protocol artifacts",
+                ),
+                "sync": CommandNode(
+                    name="sync",
+                    handler=cmd_protocol_sync,
+                    help="Refresh promoted debug/json artifacts from latest captures",
+                ),
+                "view": CommandNode(
+                    name="view",
+                    handler=cmd_protocol_view,
+                    help="View a promoted def/debug/json artifact",
+                    args=[
+                        ArgSpec(
+                            name="view_type",
+                            kind="protocol_view_type",
+                            help="def | debug | json",
+                        ),
+                        ArgSpec(
+                            name="case_name",
+                            kind="promoted_case",
+                            help="promoted opcode name",
+                        ),
+                    ],
+                ),
+            },
+        ),
+        "proxy": CommandNode(
+            name="proxy",
+            help="Inspect or modify proxy packet settings",
+            children={
+                "show": CommandNode(
+                    name="show",
+                    handler=cmd_proxy_show,
+                    help="Show current proxy settings",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                        ArgSpec(
+                            name="setting",
+                            kind="proxy_setting",
+                            optional=True,
+                            help="proxy setting path",
+                        ),
+                    ],
+                ),
+                "get": CommandNode(
+                    name="get",
+                    handler=cmd_proxy_get,
+                    help="Read one proxy setting",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                        ArgSpec(
+                            name="setting",
+                            kind="proxy_setting",
+                            optional=True,
+                            help="proxy setting path",
+                        ),
+                    ],
+                ),
+                "set": CommandNode(
+                    name="set",
+                    handler=cmd_proxy_set,
+                    help="Set one proxy setting",
+                    args=[
+                        ArgSpec(name="scope", kind="proxy_scope", optional=True, help="world | auth | route"),
+                        ArgSpec(
+                            name="route_name",
+                            kind="route_name",
+                            optional=True,
+                            help="configured route name",
+                        ),
+                        ArgSpec(
+                            name="setting",
+                            kind="proxy_setting",
+                            help="proxy setting path",
+                        ),
+                        ArgSpec(
+                            name="value",
+                            kind="proxy_value",
+                            help="depends on setting",
+                            remainder=True,
+                        ),
+                    ],
+                ),
+            },
+        ),
+    },
+)
+
+COMMANDS = ROOT_COMMAND.children

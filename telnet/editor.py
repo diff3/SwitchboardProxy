@@ -123,7 +123,8 @@ class LineEditor:
                         matches = descended
 
                 if len(matches) == 1:
-                    completed = base + matches[0] + " "
+                    suffix = "" if matches[0].endswith(",") else " "
+                    completed = base + matches[0] + suffix
                     self._set_buffer(completed)
 
                 elif len(matches) > 1:
