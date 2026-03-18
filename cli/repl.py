@@ -85,7 +85,7 @@ def run_repl_old(state, io, interactive=True):
     if interactive:
         editor = LineEditor(
             io=io,
-            prompt=b"> ",
+            prompt="€ ".encode("utf-8"),
             completer=complete,
         )
 

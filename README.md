@@ -27,6 +27,7 @@ Important top-level fields:
 - `shared.write_to_log`
 - `shared.log_file`
 - `shared.listen_host`
+- `shared.telnet`
 - `shared.proxy.adapters`
 - `shared.proxy.logging`
 - `shared.proxy.filter`
@@ -64,6 +65,13 @@ The telnet CLI supports:
 - capture dump and focus dump
 - promote / demote / protocol commands
 - tab completion for commands, route names and opcode names
+
+Optional telnet login is configured in `shared.telnet.auth`:
+
+- `enabled`
+- `username`
+- `password`
+- `max_attempts`
 
 ## Run
 

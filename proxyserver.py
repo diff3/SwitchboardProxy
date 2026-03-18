@@ -16,7 +16,6 @@ import socket
 import threading
 import itertools
 import signal
-import asyncio
 
 from proxy.utils.config_loader import ConfigLoader
 from proxy.state import SessionState, GlobalState
@@ -349,8 +348,15 @@ def run():
             name=f"proxy-route-{name}",
         ).start()
 
+    telnet_cfg = CONFIG.get("telnet", {}) or {}
     threading.Thread(
-        target=lambda: asyncio.run(run_telnet_server(STATE)),
+        target=run_telnet_server,
+        args=(
+            STATE,
+            str(telnet_cfg.get("host", "127.0.0.1")),
+            int(telnet_cfg.get("port", 1337)),
+            telnet_cfg.get("auth", {}) or {},
+        ),
         daemon=True,
         name="telnet-server",
     ).start()

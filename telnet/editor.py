@@ -1,5 +1,9 @@
+from proxy.cli.completion_utils import longest_common_prefix
+from proxy.cli.history import append_history, load_history
+
+
 class LineEditor:
-    def __init__(self, io, prompt=b"> ", completer=None):
+    def __init__(self, io, prompt="€ ".encode("utf-8"), completer=None):
         self.io = io
         self.prompt = prompt
         self.completer = completer
@@ -7,7 +11,7 @@ class LineEditor:
         self.buffer = []
         self.cursor = 0
 
-        self.history = []
+        self.history = load_history()
         self.history_index = None
         self.draft = []
 
@@ -68,6 +72,7 @@ class LineEditor:
                 line = "".join(self.buffer)
                 if line:
                     self.history.append(line)
+                    append_history(line)
                 return line
 
             # BACKSPACE
@@ -128,10 +133,14 @@ class LineEditor:
                     self._set_buffer(completed)
 
                 elif len(matches) > 1:
-                    self.io.write(b"\r\n")
-                    for m in matches:
-                        self.io.write(m.encode() + b"\r\n")
-                    self._render()
+                    common = longest_common_prefix(matches)
+                    if common and common != prefix:
+                        self._set_buffer(base + common)
+                    else:
+                        self.io.write(b"\r\n")
+                        for m in matches:
+                            self.io.write(m.encode() + b"\r\n")
+                        self._render()
 
                 continue
 

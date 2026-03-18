@@ -2,6 +2,9 @@ import sys
 import termios
 import tty
 
+from proxy.cli.completion_utils import longest_common_prefix
+from proxy.cli.history import append_history, load_history
+
 
 LEFT = "\x1b[D"
 RIGHT = "\x1b[C"
@@ -10,7 +13,7 @@ DOWN = "\x1b[B"
 
 
 class LineEditor:
-    def __init__(self, prompt="> ", completer=None, io=None):
+    def __init__(self, prompt="€ ", completer=None, io=None):
         self.prompt = prompt
         self.completer = completer
         self.io = io
@@ -18,7 +21,7 @@ class LineEditor:
         self.cursor = 0
 
         # History
-        self.history = []
+        self.history = load_history()
         self.history_index = None
         self.draft = []
 
@@ -73,6 +76,7 @@ class LineEditor:
 
                     if line:
                         self.history.append(line)
+                        append_history(line)
 
                     return line
 
@@ -180,10 +184,14 @@ class LineEditor:
                         self._set_buffer(completed)
 
                     elif len(matches) > 1:
-                        sys.stdout.write("\n")
-                        sys.stdout.write("  ".join(matches))
-                        sys.stdout.write("\n")
-                        self._redraw()
+                        common = longest_common_prefix(matches)
+                        if common and common != prefix:
+                            self._set_buffer(base + common)
+                        else:
+                            sys.stdout.write("\n")
+                            sys.stdout.write("  ".join(matches))
+                            sys.stdout.write("\n")
+                            self._redraw()
 
                     continue
 
