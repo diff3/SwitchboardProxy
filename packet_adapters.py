@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import threading
 import time
 from typing import Any
@@ -19,9 +18,10 @@ from server.modules.opcodes.AuthOpcodes import AUTH_CLIENT_OPCODES, AUTH_SERVER_
 from server.modules.opcodes.WorldOpcodes import WORLD_CLIENT_OPCODES, WORLD_SERVER_OPCODES
 import server.modules.opcodes.WorldOpcodes as world_opcode_module
 from proxy.utils.route_scope import route_phase, scoped_proxy_config
+from shared.Logger import Logger
 
 
-LOGGER = logging.getLogger("proxy")
+LOGGER = Logger
 WORLD_AUTH_RESPONSE_OPCODE = 0x01F6
 try:
     WORLD_AUTH_SESSION_OPCODE = world_opcode_module.WorldClientOpcodes.CMSG_AUTH_SESSION.value

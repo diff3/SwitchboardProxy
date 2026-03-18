@@ -2,13 +2,13 @@
 
 import socket
 import threading
-import logging
 
 from proxy.telnet.transport import TelnetIO
 from proxy.telnet.editor import LineEditor   # 👈 TELNET-editor
 from proxy.cli.repl import run_repl
+from shared.Logger import Logger
 
-LOGGER = logging.getLogger("proxy")
+LOGGER = Logger
 
 
 def run_telnet_server(global_state, host="127.0.0.1", port=1337):

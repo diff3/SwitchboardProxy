@@ -12,13 +12,10 @@ Default listen_host is 127.0.0.1.
 Binding to 0.0.0.0 exposes the proxy to the network.
 """
 
-import os
 import socket
 import threading
 import itertools
 import signal
-from logging.handlers import RotatingFileHandler
-import logging
 import asyncio
 
 from proxy.utils.config_loader import ConfigLoader
@@ -28,6 +25,8 @@ from proxy.adapters import apply_adapters
 from proxy.packet_adapters import apply_packet_adapters, configure_packet_adapters
 from proxy.telnet.server import run_telnet_server
 from proxy.utils.route_scope import route_phase, scoped_proxy_config
+from shared.ConfigLoader import ConfigLoader as SharedConfigLoader
+from shared.Logger import Logger
 
 
 # ----------------------------------------------------------------------
@@ -48,37 +47,18 @@ SOCKET_TIMEOUT = 300  # seconds
 STATE = GlobalState()
 
 # ----------------------------------------------------------------------
-# Logging (rotating, thread-safe)
+# Logging
 # ----------------------------------------------------------------------
 
-LOGGER = logging.getLogger("proxy")
-LOGGER.setLevel(logging.INFO)
+LOGGER = Logger
 
 
-def setup_logging(log_file: str):
-    log_dir = os.path.dirname(log_file)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-
-    formatter = logging.Formatter(
-        "[%(asctime)s] %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
-
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=50 * 1024 * 1024,
-        backupCount=5,
-    )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.INFO)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.INFO)
-
-    LOGGER.addHandler(file_handler)
-    LOGGER.addHandler(console_handler)
+def _project_name() -> str:
+    try:
+        cfg = SharedConfigLoader.load_config()
+    except Exception:
+        return "Unknown"
+    return str(cfg.get("project_name", "Unknown")).strip() or "Unknown"
 
 
 def _proxy_logging_cfg() -> dict:
@@ -351,7 +331,13 @@ def run():
     STATE.routes = CONFIG["routes"]
     STATE.proxy = CONFIG.setdefault("proxy", {})
 
-    setup_logging(CONFIG["log_file"])
+    Logger.configure(
+        scope="proxy",
+        write_to_log=bool(CONFIG.get("write_to_log", True)),
+        log_file=str(CONFIG.get("log_file", "proxy.log")),
+        reset=True,
+    )
+    LOGGER.info("%s Proxy starting", _project_name())
 
     for name, route in CONFIG["routes"].items():
         route["name"] = name
