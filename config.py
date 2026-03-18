@@ -36,7 +36,7 @@ CONFIG = {
                     "listen": 8085,
                     "forward": {
                         "host": "127.0.0.1",
-                        "port": 8095,
+                        "port": 8086,
                     },
                 },
             },
