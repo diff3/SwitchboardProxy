@@ -156,7 +156,7 @@ def dsl_decode_adapter(runtime, client_opcodes: dict, server_opcodes: dict) -> A
             return data
 
         try:
-            decoded = runtime.decode(name, data, silent=True)
+            decoded = runtime.decode(name, data, silent=True, warn=False)
             conn_id = getattr(state, "conn_id", "?")
             role = getattr(state, "role", "?")
             print(f"[{conn_id} {role} {direction}] {name} (0x{opcode:02X})")

@@ -46,5 +46,7 @@ class GlobalState:
     active_state: str = "default"
     routes: dict[str, Any] = field(default_factory=dict)
     proxy: dict[str, Any] = field(default_factory=dict)
+    reload_requested: bool = False
+    reload_epoch: int = 0
 
     lock: Lock = field(default_factory=Lock)

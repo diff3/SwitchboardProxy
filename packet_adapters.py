@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from DSL.modules.DslRuntime import DslRuntime
-from shared.PathUtils import get_captures_root
+from shared.PathUtils import get_captures_root, normalize_capture_profile_name
 from server.modules.interpretation.EncryptedWorldStream import EncryptedWorldStream
 from server.modules.interpretation.OpcodeResolver import OpcodeResolver
 from server.modules.interpretation.parser import parse_header
@@ -119,7 +119,7 @@ def _decode_auth_session_payload(payload: bytes) -> dict[str, Any]:
     if runtime is None:
         return {}
     try:
-        return runtime.decode("CMSG_AUTH_SESSION", payload, silent=True) or {}
+        return runtime.decode("CMSG_AUTH_SESSION", payload, silent=True, warn=False) or {}
     except Exception:
         return {}
 
@@ -170,6 +170,17 @@ def _proxy_filter_cfg(state: Any) -> dict[str, Any]:
 
 def _proxy_capture_cfg(state: Any) -> dict[str, Any]:
     return _proxy_route_cfg(state).get("capture") or {}
+
+
+def _capture_profile(state: Any) -> str | None:
+    try:
+        return normalize_capture_profile_name(_proxy_capture_cfg(state).get("profile"))
+    except Exception:
+        return None
+
+
+def _capture_root(state: Any, *, focus: bool = False):
+    return get_captures_root(focus=focus, profile=_capture_profile(state))
 
 
 def _normalize_name_list(values: Any) -> set[str]:
@@ -378,7 +389,7 @@ class DslDecodeAdapter:
                 continue
             try:
                 raw = self._decode_input(state, packet)
-                packet["decoded"] = runtime.decode(opcode_name, raw, silent=True) or {}
+                packet["decoded"] = runtime.decode(opcode_name, raw, silent=True, warn=False) or {}
             except Exception:
                 packet["decoded"] = None
         return packets
@@ -637,7 +648,12 @@ class PacketCaptureAdapter:
             return {}
 
         try:
-            decoded = runtime.decode(opcode_name, self._decode_input(state, packet), silent=True) or {}
+            decoded = runtime.decode(
+                opcode_name,
+                self._decode_input(state, packet),
+                silent=True,
+                warn=False,
+            ) or {}
             return _to_safe_json(decoded)
         except Exception:
             return {}
@@ -661,7 +677,7 @@ class PacketCaptureAdapter:
                         raw_header,
                         payload,
                         decoded,
-                        root=get_captures_root(),
+                        root=_capture_root(state),
                     )
                 except Exception as exc:
                     LOGGER.warning(
@@ -678,7 +694,7 @@ class PacketCaptureAdapter:
                         raw_header,
                         payload,
                         decoded,
-                        root=get_captures_root(focus=True),
+                        root=_capture_root(state, focus=True),
                         ts=int(time.time()),
                     )
                 except Exception as exc:

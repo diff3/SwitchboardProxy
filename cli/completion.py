@@ -10,7 +10,7 @@ from proxy.cli.commands import (
 )
 from proxy.cli.core import CompletionEngine, ParseContext, register_completion
 from proxy.config import CONFIG as DEFAULT_CONFIG
-from shared.PathUtils import get_captures_root, get_debug_root, get_def_root, get_json_root
+from shared.PathUtils import get_captures_root, get_debug_root, get_def_root, get_json_root, normalize_capture_profile_name
 from proxy.utils.route_scope import route_phase
 from server.modules.opcodes.AuthOpcodes import AUTH_CLIENT_OPCODES, AUTH_SERVER_OPCODES
 from server.modules.opcodes.WorldOpcodes import WORLD_CLIENT_OPCODES, WORLD_SERVER_OPCODES
@@ -67,8 +67,18 @@ def _route_names():
 
 
 def _capture_names() -> list[str]:
+    profile = None
+    if _STATE is not None:
+        capture_cfg = ((getattr(_STATE, "proxy", None) or {}).get("capture") or {})
+        try:
+            profile = normalize_capture_profile_name(capture_cfg.get("profile"))
+        except Exception:
+            profile = None
     names: set[str] = set()
-    for directory in (get_captures_root() / "debug", get_captures_root(focus=True) / "debug"):
+    for directory in (
+        get_captures_root(profile=profile) / "debug",
+        get_captures_root(profile=profile, focus=True) / "debug",
+    ):
         if not directory.exists():
             continue
         names.update(

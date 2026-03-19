@@ -16,6 +16,7 @@ import socket
 import threading
 import itertools
 import signal
+from copy import deepcopy
 
 from proxy.utils.config_loader import ConfigLoader
 from proxy.state import SessionState, GlobalState
@@ -34,6 +35,12 @@ from shared.Logger import Logger
 
 CONFIG = {}
 SHUTDOWN_EVENT = threading.Event()
+LISTENER_LOCK = threading.Lock()
+ACTIVE_LISTENERS: set[socket.socket] = set()
+CONNECTION_LOCK = threading.Lock()
+ACTIVE_CONNECTIONS: set[socket.socket] = set()
+ROUTE_THREADS: list[threading.Thread] = []
+TELNET_THREAD: threading.Thread | None = None
 
 MAX_CONNECTIONS = 200
 CONNECTION_SEMAPHORE = threading.Semaphore(MAX_CONNECTIONS)
@@ -50,6 +57,96 @@ STATE = GlobalState()
 # ----------------------------------------------------------------------
 
 LOGGER = Logger
+
+
+def _register_listener(listener: socket.socket) -> None:
+    with LISTENER_LOCK:
+        ACTIVE_LISTENERS.add(listener)
+
+
+def _unregister_listener(listener: socket.socket) -> None:
+    with LISTENER_LOCK:
+        ACTIVE_LISTENERS.discard(listener)
+
+
+def _register_connection(sock: socket.socket) -> None:
+    with CONNECTION_LOCK:
+        ACTIVE_CONNECTIONS.add(sock)
+
+
+def _unregister_connection(sock: socket.socket) -> None:
+    with CONNECTION_LOCK:
+        ACTIVE_CONNECTIONS.discard(sock)
+
+
+def _close_socket_quietly(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _close_all_listeners() -> None:
+    with LISTENER_LOCK:
+        listeners = list(ACTIVE_LISTENERS)
+        ACTIVE_LISTENERS.clear()
+    for listener in listeners:
+        _close_socket_quietly(listener)
+
+
+def _close_all_connections() -> None:
+    with CONNECTION_LOCK:
+        sockets = list(ACTIVE_CONNECTIONS)
+        ACTIVE_CONNECTIONS.clear()
+    for sock in sockets:
+        _close_socket_quietly(sock)
+
+
+def _sync_runtime_config() -> None:
+    CONFIG["routes"] = deepcopy(getattr(STATE, "routes", {}) or {})
+    CONFIG["proxy"] = deepcopy(getattr(STATE, "proxy", {}) or {})
+
+
+def _start_route_threads() -> list[threading.Thread]:
+    _sync_runtime_config()
+    threads: list[threading.Thread] = []
+    reload_epoch = int(getattr(STATE, "reload_epoch", 0) or 0)
+    for name, route in CONFIG["routes"].items():
+        route["name"] = name
+        route["phase"] = route_phase(name, route)
+        thread = threading.Thread(
+            target=run_route,
+            args=(CONFIG, deepcopy(route), reload_epoch),
+            name=f"proxy-route-{name}",
+        )
+        thread.start()
+        threads.append(thread)
+    return threads
+
+
+def _reload_runtime() -> None:
+    global ROUTE_THREADS
+    LOGGER.info("reloading proxy routes from runtime state")
+    STATE.reload_requested = False
+    STATE.reload_epoch = int(getattr(STATE, "reload_epoch", 0) or 0) + 1
+    _close_all_connections()
+    _close_all_listeners()
+    for thread in ROUTE_THREADS:
+        thread.join(timeout=1.0)
+    ROUTE_THREADS = _start_route_threads()
+
+
+def _join_thread_quietly(thread: threading.Thread | None, timeout: float = 2.0) -> None:
+    if thread is None or not thread.is_alive():
+        return
+    try:
+        thread.join(timeout=timeout)
+    except RuntimeError:
+        return
 
 
 def _project_name() -> str:
@@ -159,7 +256,7 @@ def build_taps(state: GlobalState, route_name: str, phase: str = ""):
 # ----------------------------------------------------------------------
 
 def pipe(source, destination, conn_id, client_addr, direction, state):
-    while not SHUTDOWN_EVENT.is_set() and not state.shutdown:
+    while not SHUTDOWN_EVENT.is_set() and not STATE.shutdown and not state.shutdown:
         try:
             data = source.recv(CONFIG["buffer_size"])
         except socket.timeout:
@@ -223,6 +320,8 @@ def handle_connection(client, client_addr, route):
     state.proxy = STATE.proxy
     configure_packet_adapters(state, CONFIG, state.route_name, state.phase)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _register_connection(client)
+    _register_connection(server)
 
     try:
         server.settimeout(SOCKET_TIMEOUT)
@@ -273,6 +372,8 @@ def handle_connection(client, client_addr, route):
 
     finally:
         state.shutdown = True
+        _unregister_connection(client)
+        _unregister_connection(server)
         client.close()
         server.close()
         CONNECTION_SEMAPHORE.release()
@@ -283,38 +384,45 @@ def handle_connection(client, client_addr, route):
 # Route runner
 # ----------------------------------------------------------------------
 
-def run_route(cfg, route):
+def run_route(cfg, route, reload_epoch: int):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.settimeout(1.0)
+    _register_listener(listener)
 
-    listener.bind((cfg["listen_host"], route["listen"]))
-    listener.listen(5)
+    try:
+        listener.bind((cfg["listen_host"], route["listen"]))
+        listener.listen(5)
 
-    LOGGER.info(
-        "listening %s:%s -> %s:%s",
-        cfg["listen_host"],
-        route["listen"],
-        route["forward"]["host"],
-        route["forward"]["port"],
-    )
+        LOGGER.info(
+            "listening %s:%s -> %s:%s",
+            cfg["listen_host"],
+            route["listen"],
+            route["forward"]["host"],
+            route["forward"]["port"],
+        )
 
-    while not SHUTDOWN_EVENT.is_set():
-        try:
-            client, client_addr = listener.accept()
-            client.settimeout(SOCKET_TIMEOUT)
+        while (
+            not SHUTDOWN_EVENT.is_set()
+            and not STATE.shutdown
+            and int(getattr(STATE, "reload_epoch", 0) or 0) == reload_epoch
+        ):
+            try:
+                client, client_addr = listener.accept()
+                client.settimeout(SOCKET_TIMEOUT)
 
-            threading.Thread(
-                target=handle_connection,
-                args=(client, client_addr, route),
-            ).start()
+                threading.Thread(
+                    target=handle_connection,
+                    args=(client, client_addr, route),
+                ).start()
 
-        except socket.timeout:
-            continue
-        except OSError:
-            break
-
-    listener.close()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    finally:
+        _unregister_listener(listener)
+        listener.close()
 
 
 # ----------------------------------------------------------------------
@@ -322,7 +430,7 @@ def run_route(cfg, route):
 # ----------------------------------------------------------------------
 
 def run():
-    global CONFIG
+    global CONFIG, ROUTE_THREADS, TELNET_THREAD
     CONFIG = ConfigLoader.load_active_config("default")
 
     # PATCH: använd global STATE, skugga den inte
@@ -338,18 +446,10 @@ def run():
     )
     LOGGER.info("%s Proxy starting", _project_name())
 
-    for name, route in CONFIG["routes"].items():
-        route["name"] = name
-        route["phase"] = route_phase(name, route)
-        threading.Thread(
-            target=run_route,
-            args=(CONFIG, route),
-            daemon=True,
-            name=f"proxy-route-{name}",
-        ).start()
+    ROUTE_THREADS = _start_route_threads()
 
     telnet_cfg = CONFIG.get("telnet", {}) or {}
-    threading.Thread(
+    TELNET_THREAD = threading.Thread(
         target=run_telnet_server,
         args=(
             STATE,
@@ -357,14 +457,20 @@ def run():
             int(telnet_cfg.get("port", 1337)),
             telnet_cfg.get("auth", {}) or {},
         ),
-        daemon=True,
         name="telnet-server",
-    ).start()
+    )
+    TELNET_THREAD.start()
 
     try:
-        SHUTDOWN_EVENT.wait()
+        while not SHUTDOWN_EVENT.wait(0.2):
+            if STATE.reload_requested:
+                _reload_runtime()
     finally:
-        pass
+        _close_all_connections()
+        _close_all_listeners()
+        for thread in ROUTE_THREADS:
+            _join_thread_quietly(thread)
+        _join_thread_quietly(TELNET_THREAD)
 
 
 if __name__ == "__main__":
