@@ -19,7 +19,13 @@ import signal
 from copy import deepcopy
 
 from proxy.utils.config_loader import ConfigLoader
-from proxy.state import SessionState, GlobalState
+from proxy.state import (
+    DEFAULT_PROXY_STATE_PATH,
+    SessionState,
+    GlobalState,
+    load_state,
+    save_state,
+)
 from proxy.state_machine import update_state
 from proxy.adapters import apply_adapters
 from proxy.packet_adapters import apply_packet_adapters, configure_packet_adapters
@@ -430,13 +436,8 @@ def run_route(cfg, route, reload_epoch: int):
 # ----------------------------------------------------------------------
 
 def run():
-    global CONFIG, ROUTE_THREADS, TELNET_THREAD
+    global CONFIG, ROUTE_THREADS, TELNET_THREAD, STATE
     CONFIG = ConfigLoader.load_active_config("default")
-
-    # PATCH: använd global STATE, skugga den inte
-    STATE.active_state = "default"
-    STATE.routes = CONFIG["routes"]
-    STATE.proxy = CONFIG.setdefault("proxy", {})
 
     Logger.configure(
         scope="proxy",
@@ -445,6 +446,10 @@ def run():
         reset=True,
     )
     LOGGER.info("%s Proxy starting", _project_name())
+
+    STATE = load_state(DEFAULT_PROXY_STATE_PATH)
+    CONFIG = ConfigLoader.load_active_config(STATE.active_state)
+    _sync_runtime_config()
 
     ROUTE_THREADS = _start_route_threads()
 
@@ -471,6 +476,7 @@ def run():
         for thread in ROUTE_THREADS:
             _join_thread_quietly(thread)
         _join_thread_quietly(TELNET_THREAD)
+        save_state(STATE, DEFAULT_PROXY_STATE_PATH)
 
 
 if __name__ == "__main__":

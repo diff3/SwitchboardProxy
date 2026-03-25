@@ -9,6 +9,13 @@ import time
 from typing import Any
 
 from DSL.modules.DslRuntime import DslRuntime
+from proxy.protocol_analysis import (
+    PROTOCOL_LEGACY,
+    PROTOCOL_SRP6,
+    PROTOCOL_UNKNOWN,
+    analyze_packet,
+    configured_protocol_hint,
+)
 from shared.PathUtils import get_captures_root, normalize_capture_profile_name
 from server.modules.interpretation.EncryptedWorldStream import EncryptedWorldStream
 from server.modules.interpretation.OpcodeResolver import OpcodeResolver
@@ -19,7 +26,6 @@ from server.modules.opcodes.WorldOpcodes import WORLD_CLIENT_OPCODES, WORLD_SERV
 import server.modules.opcodes.WorldOpcodes as world_opcode_module
 from proxy.utils.route_scope import route_phase, scoped_proxy_config
 from shared.Logger import Logger
-
 
 LOGGER = Logger
 WORLD_AUTH_RESPONSE_OPCODE = 0x01F6
@@ -32,6 +38,8 @@ _RUNTIME: DslRuntime | None = None
 _DB_LOCK = threading.Lock()
 _DB_CONNECTION: Any = None
 _DB_FAILED = False
+_AUTH_PROTOCOL_LOCK = threading.Lock()
+_AUTH_PROTOCOL_BY_ACCOUNT: dict[str, str] = {}
 
 _AUTH_FIXED_LENGTHS_C = {
     "AUTH_LOGON_PROOF_C": 75,
@@ -127,6 +135,47 @@ def _decode_auth_session_payload(payload: bytes) -> dict[str, Any]:
 def _resolve_auth_account(decoded: dict[str, Any]) -> str:
     account = decoded.get("account") or decoded.get("username") or decoded.get("I") or ""
     return str(account).strip()
+
+
+def _coerce_bytes(value: Any) -> bytes | None:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return bytes.fromhex(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _create_world_crypto(session_key: bytes):
+    from server.modules.crypto.ARC4Crypto import Arc4CryptoHandler
+
+    crypto = Arc4CryptoHandler()
+    crypto.init_arc4(session_key.hex())
+    return crypto
+
+
+def _remember_account_protocol(account: str | None, protocol: str | None) -> None:
+    normalized_account = str(account or "").strip().upper()
+    normalized_protocol = str(protocol or "").strip().upper()
+    if not normalized_account or normalized_protocol not in {PROTOCOL_SRP6, PROTOCOL_LEGACY}:
+        return
+    with _AUTH_PROTOCOL_LOCK:
+        _AUTH_PROTOCOL_BY_ACCOUNT[normalized_account] = normalized_protocol
+
+
+def _lookup_account_protocol(account: str | None) -> str:
+    normalized_account = str(account or "").strip().upper()
+    if not normalized_account:
+        return PROTOCOL_UNKNOWN
+    with _AUTH_PROTOCOL_LOCK:
+        return _AUTH_PROTOCOL_BY_ACCOUNT.get(normalized_account, PROTOCOL_UNKNOWN)
 
 
 def _normalize_raw_format(raw_format: str | None) -> str:
@@ -400,6 +449,81 @@ class DslDecodeAdapter:
         return bytes(packet["payload"])
 
 
+class ProtocolAnalysisAdapter:
+    """
+    Analyze decoded auth packets and persist semantic auth context per connection.
+
+    The analyzer is intentionally read-only with respect to packet bytes and DSL
+    decoded output. It only enriches packet metadata and SessionState fields.
+    """
+
+    def __call__(self, state: Any, packets: list[dict[str, Any]], direction: str) -> list[dict[str, Any]]:
+        _ = direction
+        for packet in packets:
+            analysis = analyze_packet(state, packet)
+            packet["analysis"] = analysis
+            self._apply_analysis(state, packet, analysis)
+        return packets
+
+    def _apply_analysis(self, state: Any, packet: dict[str, Any], analysis: dict[str, Any]) -> None:
+        conn_id = getattr(state, "conn_id", 0)
+        detected = str(analysis.get("auth_type") or PROTOCOL_UNKNOWN).upper()
+        stage = str(analysis.get("stage") or "").strip()
+        reason = str(analysis.get("reason") or "").strip()
+        username = analysis.get("username") or getattr(state, "username", None)
+        configured_hint = configured_protocol_hint(state)
+
+        cached_protocol = _lookup_account_protocol(username)
+        if (
+            configured_hint == PROTOCOL_UNKNOWN
+            and cached_protocol in {PROTOCOL_SRP6, PROTOCOL_LEGACY}
+            and detected != cached_protocol
+        ):
+            analysis["auth_type"] = cached_protocol
+            analysis["reason"] = "auth_cache"
+            detected = cached_protocol
+            reason = "auth_cache"
+
+        if stage and stage != getattr(state, "auth_stage", ""):
+            state.auth_stage = stage
+            LOGGER.info("[ANALYZE] Stage=%s conn=%s", stage, conn_id)
+
+        if detected in {PROTOCOL_SRP6, PROTOCOL_LEGACY}:
+            current = str(getattr(state, "protocol", PROTOCOL_UNKNOWN) or PROTOCOL_UNKNOWN).upper()
+            if current == PROTOCOL_UNKNOWN:
+                state.protocol = detected
+                if reason:
+                    LOGGER.info("[PROTO] Detected %s conn=%s reason=%s", detected, conn_id, reason)
+                else:
+                    LOGGER.info("[PROTO] Detected %s conn=%s", detected, conn_id)
+            elif current != detected:
+                LOGGER.warning(
+                    "[PROTO] Conflict conn=%s current=%s new=%s opcode=%s",
+                    conn_id,
+                    current,
+                    detected,
+                    packet.get("opcode_name", ""),
+                )
+
+        if username:
+            normalized = str(username).strip()
+            if normalized and normalized != getattr(state, "username", None):
+                state.username = normalized
+                LOGGER.info("[ANALYZE] Extracted username=%s conn=%s", normalized, conn_id)
+            if detected in {PROTOCOL_SRP6, PROTOCOL_LEGACY} and getattr(state, "phase", "") == "auth":
+                _remember_account_protocol(normalized, detected)
+
+        session_key = analysis.get("session_key")
+        if isinstance(session_key, bytes) and session_key:
+            state.session_key = session_key
+
+        state.auth_analysis = {
+            "protocol": getattr(state, "protocol", PROTOCOL_UNKNOWN),
+            "stage": getattr(state, "auth_stage", ""),
+            "username": getattr(state, "username", None),
+        }
+
+
 class WorldCryptoInitAdapter:
     def __call__(self, state: Any, packets: list[dict[str, Any]], direction: str) -> list[dict[str, Any]]:
         _ = direction
@@ -418,7 +542,15 @@ class WorldCryptoInitAdapter:
             if not isinstance(decoded, dict) or not decoded:
                 decoded = _decode_auth_session_payload(bytes(packet.get("payload", b"")))
 
-            account = _resolve_auth_account(decoded)
+            analysis = packet.get("analysis")
+            if not isinstance(analysis, dict):
+                analysis = {}
+
+            account = str(
+                analysis.get("username")
+                or getattr(state, "username", None)
+                or _resolve_auth_account(decoded)
+            ).strip()
             if not account:
                 LOGGER.warning(
                     "conn=%s route=world auth-session missing account name",
@@ -431,10 +563,15 @@ class WorldCryptoInitAdapter:
                 continue
 
             try:
-                from server.modules.crypto.ARC4Crypto import Arc4CryptoHandler
+               
 
                 row = db.get_user_by_username(account.upper())
-                if row is None or not getattr(row, "session_key", None):
+                session_key = (
+                    getattr(row, "session_key", None)
+                    or getattr(row, "sessionkey", None)
+                ) if row is not None else None
+                session_key_bytes = _coerce_bytes(session_key)
+                if row is None or not session_key_bytes:
                     LOGGER.warning(
                         "conn=%s route=world missing session key for account=%s",
                         getattr(state, "conn_id", 0),
@@ -442,18 +579,21 @@ class WorldCryptoInitAdapter:
                     )
                     continue
 
-                crypto = Arc4CryptoHandler()
-                crypto.init_arc4(row.session_key.hex())
+                crypto = _create_world_crypto(session_key_bytes)
+                state.session_key = session_key_bytes
                 state.world_crypto = crypto
                 state.encrypted = True
+                if getattr(state, "encrypted_world_stream", None) is None:
+                    state.encrypted_world_stream = EncryptedWorldStream()
 
                 for pending_direction in ("C", "S"):
                     if state.packet_buffers[pending_direction]:
                         state.packet_reparse_directions.add(pending_direction)
 
                 LOGGER.info(
-                    "conn=%s route=world world-crypto initialized account=%s",
+                    "conn=%s route=world world-crypto initialized protocol=%s account=%s",
                     getattr(state, "conn_id", 0),
+                    getattr(state, "protocol", PROTOCOL_UNKNOWN),
                     account,
                 )
             except Exception as exc:
@@ -714,8 +854,12 @@ def configure_packet_adapters(state: Any, config: dict, route_name: str, route_p
     state.packet_adapters = [OpcodeResolverAdapter(route_phase_name)]
 
     state.packet_adapters.append(DslDecodeAdapter())
+    state.packet_adapters.append(ProtocolAnalysisAdapter())
+
     if route_phase_name == "world":
+        _ = config
         state.packet_adapters.append(WorldCryptoInitAdapter())
+
     state.packet_adapters.append(PacketCaptureAdapter())
     state.packet_adapters.append(LoggingAdapter())
 

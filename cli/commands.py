@@ -8,6 +8,7 @@ from pathlib import Path
 
 from proxy.cli.core import ArgSpec, CommandNode, ParseContext, register_arg_type
 from proxy.config import CONFIG as DEFAULT_CONFIG, _CONFIG_PATH
+from proxy.state import DEFAULT_PROXY_STATE_PATH, save_state
 from proxy.utils.config_loader import ConfigLoader
 from proxy.utils.route_scope import route_phase, scoped_proxy_config
 from shared.Logger import Logger
@@ -80,6 +81,10 @@ def _runtime_state_snapshot(state) -> dict:
 
 def _proxy_log_file() -> str:
     return str(DEFAULT_CONFIG.get("log_file", "proxy.log") or "proxy.log")
+
+
+def _persist_runtime_state(state) -> None:
+    save_state(state, DEFAULT_PROXY_STATE_PATH)
 
 
 def _sync_default_config(config_data: dict) -> None:
@@ -535,6 +540,7 @@ def cmd_route_set(state, args):
         return [f"invalid value for {path}: {exc}"]
 
     _set_nested_value(route, path, value)
+    _persist_runtime_state(state)
     return [f"route {route_name} {path} = {value}", "run 'reload' to apply listener changes"]
 
 
@@ -552,11 +558,11 @@ def cmd_state_use(state, args):
         return ["usage: state use <name>"]
 
     name = args[0]
-
-    try:
-        cfg = ConfigLoader.load_active_config(name)
-    except Exception:
+    states_cfg = DEFAULT_CONFIG.get("states", {}) or {}
+    if name not in states_cfg:
         return [f"unknown state: {name}"]
+
+    cfg = ConfigLoader.load_active_config(name)
 
     state.routes.clear()
     state.routes.update(cfg["routes"])
@@ -568,6 +574,7 @@ def cmd_state_use(state, args):
         if key in cfg:
             setattr(state, key, cfg[key])
 
+    _persist_runtime_state(state)
     return [f"state switched to '{name}'"]
 
 
@@ -696,6 +703,7 @@ def cmd_proxy_set(state, args):
         value = updated
 
     _set_nested_value(_proxy_scope_config(state, scope, scope_name), path, value)
+    _persist_runtime_state(state)
     prefix = _proxy_scope_label(scope, scope_name)
     display_value = "<default>" if path == "capture.profile" and not str(value).strip() else value
     return [f"{prefix}{path} = {display_value}"]
@@ -725,6 +733,7 @@ def cmd_proxy_rm(state, args):
     current = _proxy_list_value(state, scope, scope_name, path)
     updated = [item for item in current if item not in values]
     _set_nested_value(_proxy_scope_config(state, scope, scope_name), path, updated)
+    _persist_runtime_state(state)
     prefix = _proxy_scope_label(scope, scope_name)
     return [f"{prefix}{path} = {updated}"]
 
@@ -744,6 +753,7 @@ def cmd_proxy_clear(state, args):
         return [f"proxy clear only supports list settings: {path}"]
 
     _set_nested_value(_proxy_scope_config(state, scope, scope_name), path, [])
+    _persist_runtime_state(state)
     prefix = _proxy_scope_label(scope, scope_name)
     return [f"cleared {prefix}{path}"]
 
@@ -765,6 +775,7 @@ def cmd_save(state, args):
 
     _write_json(_CONFIG_PATH, config_data)
     _sync_default_config(config_data)
+    _persist_runtime_state(state)
     return [f"saved runtime settings to state '{state_name}'"]
 
 
@@ -809,6 +820,7 @@ def cmd_reset(state, args):
         for key in ("enable_log", "enable_view", "enable_decode"):
             if key in cfg:
                 setattr(state, key, cfg[key])
+        _persist_runtime_state(state)
         return [f"reset state '{_active_state_name(state)}' to config defaults"]
 
     if scope == "route" and not _route_exists(state, name):
@@ -818,6 +830,7 @@ def cmd_reset(state, args):
     default_cfg = _default_proxy_scope_config(state, scope, name)
     target_cfg.clear()
     target_cfg.update(default_cfg)
+    _persist_runtime_state(state)
     return [f"reset {_scope_display_name(scope, name)} proxy settings"]
 
 
@@ -845,6 +858,7 @@ def cmd_focus_clear(state, args):
         return [f"unknown route: {name}"]
 
     _set_nested_value(_proxy_scope_config(state, scope, name), "capture.focus", [])
+    _persist_runtime_state(state)
     return [f"cleared focus for {_scope_display_name(scope, name)}"]
 
 
@@ -871,6 +885,7 @@ def _cmd_focus_update(state, args, *, remove: bool):
             if item not in updated:
                 updated.append(item)
     _set_nested_value(_proxy_scope_config(state, scope, name), "capture.focus", updated)
+    _persist_runtime_state(state)
     return [f"focus ({_scope_display_name(scope, name)}) = {_joined_names(updated)}"]
 
 
