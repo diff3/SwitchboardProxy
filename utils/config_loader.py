@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from proxy.config import CONFIG as DEFAULT_CONFIG
+from shared.ConfigLoader import ConfigLoader as SharedConfigLoader
 
 
 class ConfigLoader:
@@ -11,11 +12,10 @@ class ConfigLoader:
         default = DEFAULT_CONFIG["states"]["default"]
         override = DEFAULT_CONFIG["states"].get(state_name, {})
 
-        # shallow merge first
-        cfg = {**base, **default}
+        cfg = ConfigLoader._merge_dicts(base, default)
 
         # routes need deep merge by name
-        routes = deepcopy(default["routes"])
+        routes = deepcopy(default.get("routes", {}))
 
         for name, route in override.get("routes", {}).items():
             routes[name] = ConfigLoader._merge_dicts(
@@ -45,3 +45,45 @@ class ConfigLoader:
                 result[k] = v
 
         return result
+
+    @staticmethod
+    def _logging_defaults(cfg: dict) -> dict:
+        logging_cfg = deepcopy(cfg.get("logging", {}))
+        return {
+            "write_to_log": bool(logging_cfg.get("write_to_log", True)),
+            "log_file": str(logging_cfg.get("log_file", "proxy.log") or "proxy.log"),
+            "logging_levels": str(logging_cfg.get("logging_levels", "All") or "All"),
+            "logging_file_levels": str(
+                logging_cfg.get("logging_file_levels", "All") or "All"
+            ),
+            "show_scope": bool(logging_cfg.get("show_scope", False)),
+            "date_format": str(
+                logging_cfg.get("date_format", " [%Y-%m-%d %H:%M:%S]")
+                or " [%Y-%m-%d %H:%M:%S]"
+            ),
+        }
+
+    @staticmethod
+    def _path_defaults(cfg: dict) -> dict:
+        paths_cfg = deepcopy(cfg.get("paths", {}))
+        return {
+            "root": str(paths_cfg.get("root", ".") or "."),
+            "def_dir": str(paths_cfg.get("def_dir", "data/def") or "data/def"),
+            "capture_dir": str(paths_cfg.get("capture_dir", "data/captures") or "data/captures"),
+            "logs": str(paths_cfg.get("logs", "logs") or "logs"),
+            "json_dir": str(paths_cfg.get("json_dir", "data/json") or "data/json"),
+            "debug_dir": str(paths_cfg.get("debug_dir", "data/debug") or "data/debug"),
+        }
+
+    @staticmethod
+    def load_runtime_config(state_name: str) -> dict:
+        cfg = deepcopy(ConfigLoader.load_active_config(state_name))
+        cfg["paths"] = ConfigLoader._path_defaults(cfg)
+        cfg["Logging"] = ConfigLoader._logging_defaults(cfg)
+        return cfg
+
+    @staticmethod
+    def install_shared_runtime_config(state_name: str) -> dict:
+        runtime_cfg = ConfigLoader.load_runtime_config(state_name)
+        SharedConfigLoader.set_runtime_config(runtime_cfg)
+        return runtime_cfg

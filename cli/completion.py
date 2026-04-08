@@ -6,6 +6,9 @@ from proxy.cli.commands import (
     _PROXY_PHASES,
     _PROXY_SETTING_CHOICES,
     _PROXY_SETTING_TYPES,
+    _STATE_DB_KEYS,
+    _STATE_FLAGS,
+    _STATE_MODE_CHOICES,
     resolve_effective_kind,
 )
 from proxy.cli.core import CompletionEngine, ParseContext, register_completion
@@ -123,6 +126,18 @@ def complete_state_name(ctx: ParseContext) -> list[str]:
     return _match_prefix(states, ctx.current_prefix)
 
 
+def complete_state_flag(ctx: ParseContext) -> list[str]:
+    return _match_prefix(sorted(_STATE_FLAGS), ctx.current_prefix)
+
+
+def complete_state_db_key(ctx: ParseContext) -> list[str]:
+    return _match_prefix(sorted(_STATE_DB_KEYS), ctx.current_prefix)
+
+
+def complete_state_mode(ctx: ParseContext) -> list[str]:
+    return _match_prefix(sorted(_STATE_MODE_CHOICES), ctx.current_prefix.lower())
+
+
 def complete_capture_name(ctx: ParseContext) -> list[str]:
     return _match_prefix(_capture_names(), ctx.current_prefix)
 
@@ -193,6 +208,9 @@ register_completion("route", complete_route)
 register_completion("proxy_scope", complete_proxy_scope)
 register_completion("route_name", complete_route_name)
 register_completion("state_name", complete_state_name)
+register_completion("state_flag", complete_state_flag)
+register_completion("state_db_key", complete_state_db_key)
+register_completion("state_mode", complete_state_mode)
 register_completion("capture_name", complete_capture_name)
 register_completion("promoted_case", complete_promoted_case)
 register_completion("proxy_setting", complete_proxy_setting)

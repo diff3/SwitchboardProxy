@@ -295,6 +295,12 @@ def describe_arg(
         return "configured route name"
     if kind == "state_name":
         return "configured state name"
+    if kind == "state_flag":
+        return "enable_log | enable_view | enable_decode"
+    if kind == "state_db_key":
+        return "auth_db | world_db | characters_db"
+    if kind == "state_mode":
+        return "legacy | srp6"
     if kind == "proxy_setting":
         return "proxy setting path"
     if kind == "proxy_value":

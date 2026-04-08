@@ -78,6 +78,7 @@ class ProxyState:
         if normalized_state not in (DEFAULT_CONFIG.get("states", {}) or {}):
             normalized_state = "default"
 
+        ConfigLoader.install_shared_runtime_config(normalized_state)
         cfg = ConfigLoader.load_active_config(normalized_state)
         state = cls()
         state.active_state = normalized_state
@@ -118,6 +119,8 @@ class ProxyState:
         if isinstance(data.get("proxy"), dict):
             state.proxy = deepcopy(data["proxy"])
 
+        _sync_world_mode_from_active_config(state)
+
         state.shutdown = False
         state.reload_requested = False
         state.reload_epoch = 0
@@ -127,8 +130,19 @@ class ProxyState:
 GlobalState = ProxyState
 
 
+def _sync_world_mode_from_active_config(state: ProxyState) -> None:
+    cfg = ConfigLoader.load_active_config(str(state.active_state or "default"))
+    configured_mode = str(
+        ((((cfg.get("proxy") or {}).get("phases") or {}).get("world") or {}).get("mode") or "srp6")
+    ).strip().lower()
+    world_mode = "legacy" if configured_mode == "legacy" else "srp6"
+    state.proxy.setdefault("phases", {}).setdefault("world", {})["mode"] = world_mode
+
+
 def save_state(state: ProxyState, path: str | Path = DEFAULT_PROXY_STATE_PATH) -> bool:
     state_path = Path(path)
+    state_label = state_path.name
+    ConfigLoader.install_shared_runtime_config(str(getattr(state, "active_state", "default") or "default"))
     payload = state.to_dict()
     tmp_path = state_path.with_name(f"{state_path.name}.tmp")
 
@@ -139,10 +153,10 @@ def save_state(state: ProxyState, path: str | Path = DEFAULT_PROXY_STATE_PATH) -
             encoding="utf-8",
         )
         tmp_path.replace(state_path)
-        Logger.info("[STATE] Saved to disk: %s", state_path, scope="proxy")
+        Logger.info("[STATE] Saved to disk: %s", state_label, scope="proxy")
         return True
     except Exception as exc:
-        Logger.error("[STATE] Save failed: %s (%s)", state_path, exc, scope="proxy")
+        Logger.error("[STATE] Save failed: %s (%s)", state_label, exc, scope="proxy")
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
@@ -153,19 +167,24 @@ def save_state(state: ProxyState, path: str | Path = DEFAULT_PROXY_STATE_PATH) -
 
 def load_state(path: str | Path = DEFAULT_PROXY_STATE_PATH) -> ProxyState:
     state_path = Path(path)
+    state_label = state_path.name
 
     if not state_path.exists():
+        ConfigLoader.install_shared_runtime_config("default")
         state = ProxyState.from_active_config("default")
-        Logger.info("[STATE] Fallback to default (missing): %s", state_path, scope="proxy")
+        Logger.info("[STATE] Fallback to default (missing): %s", state_label, scope="proxy")
         return state
 
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
+        active_state = str(data.get("active_state", "default") or "default") if isinstance(data, dict) else "default"
+        ConfigLoader.install_shared_runtime_config(active_state)
         state = ProxyState.from_dict(data)
-        Logger.info("[STATE] Loaded from disk: %s", state_path, scope="proxy")
+        Logger.info("[STATE] Loaded from disk: %s", state_label, scope="proxy")
         return state
     except Exception as exc:
-        Logger.error("[STATE] Load failed: %s (%s)", state_path, exc, scope="proxy")
+        ConfigLoader.install_shared_runtime_config("default")
+        Logger.error("[STATE] Load failed: %s (%s)", state_label, exc, scope="proxy")
         state = ProxyState.from_active_config("default")
-        Logger.info("[STATE] Fallback to default (corrupt): %s", state_path, scope="proxy")
+        Logger.info("[STATE] Fallback to default (corrupt): %s", state_label, scope="proxy")
         return state

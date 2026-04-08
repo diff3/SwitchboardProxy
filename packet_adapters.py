@@ -20,19 +20,30 @@ from shared.PathUtils import get_captures_root, normalize_capture_profile_name
 from server.modules.interpretation.EncryptedWorldStream import EncryptedWorldStream
 from server.modules.interpretation.OpcodeResolver import OpcodeResolver
 from server.modules.interpretation.parser import parse_header
-from server.modules.PacketDump import dump_capture
+from server.modules.protocol.PacketDump import dump_capture
 from server.modules.opcodes.AuthOpcodes import AUTH_CLIENT_OPCODES, AUTH_SERVER_OPCODES
 from server.modules.opcodes.WorldOpcodes import WORLD_CLIENT_OPCODES, WORLD_SERVER_OPCODES
 import server.modules.opcodes.WorldOpcodes as world_opcode_module
 from proxy.utils.route_scope import route_phase, scoped_proxy_config
 from shared.Logger import Logger
 
+from proxy.protocol_analysis import PROTOCOL_LEGACY, PROTOCOL_SRP6, PROTOCOL_UNKNOWN
+from server.modules.interpretation.EncryptedWorldStream import EncryptedWorldStream
+
 LOGGER = Logger
 WORLD_AUTH_RESPONSE_OPCODE = 0x01F6
+try:
+    WORLD_AUTH_CHALLENGE_OPCODE = world_opcode_module.WorldServerOpcodes.SMSG_AUTH_CHALLENGE.value
+except Exception:
+    WORLD_AUTH_CHALLENGE_OPCODE = 0x0949
 try:
     WORLD_AUTH_SESSION_OPCODE = world_opcode_module.WorldClientOpcodes.CMSG_AUTH_SESSION.value
 except Exception:
     WORLD_AUTH_SESSION_OPCODE = 0x00B2
+SERVER_AUTH_RESPONSE_SIZE_ADJUST = {
+    PROTOCOL_LEGACY: 0,
+    PROTOCOL_SRP6: -4,
+}
 _RUNTIME_LOCK = threading.Lock()
 _RUNTIME: DslRuntime | None = None
 _DB_LOCK = threading.Lock()
@@ -98,28 +109,53 @@ def _get_database_connection() -> Any:
     global _DB_CONNECTION
     global _DB_FAILED
 
-    if _DB_CONNECTION is not None:
-        return _DB_CONNECTION
     if _DB_FAILED:
         return None
 
     with _DB_LOCK:
-        if _DB_CONNECTION is not None:
-            return _DB_CONNECTION
         if _DB_FAILED:
             return None
         try:
+            should_log_ready = _DB_CONNECTION is None
             from server.modules.database.DatabaseConnection import DatabaseConnection
 
             DatabaseConnection.initialize()
             _DB_CONNECTION = DatabaseConnection
-            LOGGER.info("proxy packet adapters: auth database ready")
+            _DB_FAILED = False
+            if should_log_ready:
+                LOGGER.info("proxy packet adapters: auth database ready")
         except Exception as exc:
             LOGGER.warning("proxy packet adapters: auth database init failed: %s", exc)
             _DB_FAILED = True
             _DB_CONNECTION = None
 
     return _DB_CONNECTION
+
+
+def reset_packet_adapter_runtime() -> None:
+    global _DB_CONNECTION
+    global _DB_FAILED
+
+    with _DB_LOCK:
+        _DB_CONNECTION = None
+        _DB_FAILED = False
+
+    try:
+        from server.modules.database.DatabaseConnection import DatabaseConnection
+
+        DatabaseConnection._dispose_existing()
+        DatabaseConnection._reset_caches()
+    except Exception:
+        pass
+
+    try:
+        from server.modules.auth.AuthConnection import AuthConnection
+
+        AuthConnection._dispose_existing()
+    except Exception:
+        pass
+
+    LOGGER.info("proxy packet adapters: database runtime reset")
 
 
 def _decode_auth_session_payload(payload: bytes) -> dict[str, Any]:
@@ -153,12 +189,94 @@ def _coerce_bytes(value: Any) -> bytes | None:
     return None
 
 
-def _create_world_crypto(session_key: bytes):
+def _normalize_world_session_key(protocol: str, session_key: bytes) -> bytes:
+    normalized_protocol = str(protocol or "").strip().upper()
+    if normalized_protocol == PROTOCOL_LEGACY:
+        # Legacy world ARC4 expects the SRP session key in reverse byte order.
+        return session_key[::-1]
+    return session_key
+
+
+def _create_world_crypto(protocol: str, session_key: bytes):
     from server.modules.crypto.ARC4Crypto import Arc4CryptoHandler
 
+    key_bytes = _normalize_world_session_key(protocol, session_key)
     crypto = Arc4CryptoHandler()
-    crypto.init_arc4(session_key.hex())
+    crypto.init_arc4(key_bytes.hex())
     return crypto
+
+
+def _decode_world_header_value(header_bytes: bytes) -> tuple[int, int]:
+    value = int.from_bytes(header_bytes[:4], "little")
+    cmd = value & 0x1FFF
+    size = (value & 0xFFFFE000) >> 13
+    return cmd, size
+
+
+def _probe_first_server_encrypted_header(state: Any, enc_header: bytes) -> None:
+    if getattr(state, "_server_header_probe_logged", False):
+        return
+
+    session_key = getattr(state, "session_key", None)
+    protocol = str(getattr(state, "protocol", "") or "").upper()
+    if not isinstance(session_key, (bytes, bytearray)) or not session_key:
+        return
+
+    try:
+        probe_encrypt = _create_world_crypto(protocol, bytes(session_key))
+        plain_encrypt = probe_encrypt.encrypt_send(enc_header)
+        enc_cmd, enc_size = _decode_world_header_value(plain_encrypt)
+
+        probe_decrypt = _create_world_crypto(protocol, bytes(session_key))
+        plain_decrypt = probe_decrypt.decrypt_recv(enc_header)
+        dec_cmd, dec_size = _decode_world_header_value(plain_decrypt)
+
+        LOGGER.info(
+            "conn=%s route=world first-S-header probe raw=%s encrypt_send=%s(cmd=0x%04X size=%s) decrypt_recv=%s(cmd=0x%04X size=%s)",
+            getattr(state, "conn_id", 0),
+            enc_header.hex(),
+            plain_encrypt.hex(),
+            enc_cmd,
+            enc_size,
+            plain_decrypt.hex(),
+            dec_cmd,
+            dec_size,
+        )
+        state._server_header_probe_logged = True
+    except Exception as exc:
+        LOGGER.warning(
+            "conn=%s route=world failed server-header probe: %s",
+            getattr(state, "conn_id", 0),
+            exc,
+        )
+
+
+def get_account_row(db: Any, protocol: str, username: str):
+    normalized_username = str(username or "").strip().upper()
+    if not normalized_username:
+        return None
+
+    if protocol == PROTOCOL_LEGACY:
+        from server.modules.database.AuthModelLegacy import AccountLegacy
+
+        return (
+            db.auth_legacy()
+            .query(AccountLegacy)
+            .filter(AccountLegacy.username == normalized_username)
+            .first()
+        )
+
+    if protocol == PROTOCOL_SRP6:
+        from server.modules.database.AuthModel import Account
+
+        return (
+            db.auth()
+            .query(Account)
+            .filter(Account.username == normalized_username)
+            .first()
+        )
+
+    return None
 
 
 def _remember_account_protocol(account: str | None, protocol: str | None) -> None:
@@ -266,7 +384,26 @@ class PacketParserAdapter:
                 return []
             raw_buf = state.packet_buffers[packet_direction]
             raw_buf.extend(data)
+            if packet_direction == "S" and len(raw_buf) >= 4:
+                _probe_first_server_encrypted_header(state, bytes(raw_buf[:4]))
             packets = stream.feed(raw_buf, crypto=crypto, direction=packet_direction)
+            if packet_direction == "S":
+                if any(int(header.cmd) == WORLD_AUTH_RESPONSE_OPCODE for _, header, _ in packets):
+                    state._post_auth_response_seen = True
+                if getattr(state, "_post_auth_response_seen", False) and not getattr(
+                    state, "_post_auth_pending_logged", False
+                ):
+                    pending = getattr(stream, "_pending", {}).get("S")
+                    if pending is not None:
+                        LOGGER.info(
+                            "conn=%s route=world post-auth pending cmd=0x%04X size=%s buffered=%s raw=%s",
+                            getattr(state, "conn_id", 0),
+                            int(pending.get("cmd", 0)),
+                            int(pending.get("size", 0)),
+                            len(raw_buf),
+                            bytes(pending.get("raw", b"")).hex(),
+                        )
+                        state._post_auth_pending_logged = True
             return [
                 {
                     "direction": packet_direction,
@@ -306,6 +443,14 @@ class PacketParserAdapter:
             header = bytes(raw_buf[:4])
             size, opcode, _hex_opcode = parse_header(header)
             if size is None or opcode is None:
+                break
+
+            # In plaintext world mode the server only emits HANDSHAKE and
+            # SMSG_AUTH_CHALLENGE before ARC4 is initialized. If encrypted
+            # S→C bytes arrive slightly before the CMSG_AUTH_SESSION thread
+            # flips the connection into encrypted mode, treating them as plain
+            # headers will consume and permanently desync the server stream.
+            if packet_direction == "S" and int(opcode) != WORLD_AUTH_CHALLENGE_OPCODE:
                 break
 
             payload_len = max(0, int(size) - 2)
@@ -527,14 +672,19 @@ class ProtocolAnalysisAdapter:
 class WorldCryptoInitAdapter:
     def __call__(self, state: Any, packets: list[dict[str, Any]], direction: str) -> list[dict[str, Any]]:
         _ = direction
+
+        # Only run in world phase
         if getattr(state, "phase", "") != "world":
             return packets
+
+        # Skip if already initialized
         if getattr(state, "world_crypto", None) is not None or getattr(state, "encrypted", False):
             return packets
 
         for packet in packets:
             if packet.get("direction") != "C":
                 continue
+
             if int(packet.get("opcode", -1)) != WORLD_AUTH_SESSION_OPCODE:
                 continue
 
@@ -551,6 +701,7 @@ class WorldCryptoInitAdapter:
                 or getattr(state, "username", None)
                 or _resolve_auth_account(decoded)
             ).strip()
+
             if not account:
                 LOGGER.warning(
                     "conn=%s route=world auth-session missing account name",
@@ -558,51 +709,83 @@ class WorldCryptoInitAdapter:
                 )
                 continue
 
-            db = _get_database_connection()
-            if db is None:
-                continue
-
             try:
-               
-
-                row = db.get_user_by_username(account.upper())
-                session_key = (
-                    getattr(row, "session_key", None)
-                    or getattr(row, "sessionkey", None)
-                ) if row is not None else None
-                session_key_bytes = _coerce_bytes(session_key)
-                if row is None or not session_key_bytes:
+                protocol = str(getattr(state, "protocol", PROTOCOL_UNKNOWN)).upper()
+                db = _get_database_connection()
+                if db is None:
                     LOGGER.warning(
-                        "conn=%s route=world missing session key for account=%s",
+                        "conn=%s route=world auth database unavailable",
                         getattr(state, "conn_id", 0),
+                    )
+                    continue
+
+                row = get_account_row(db, protocol, account)
+
+                if row is None:
+                    if protocol not in {PROTOCOL_LEGACY, PROTOCOL_SRP6}:
+                        LOGGER.warning(
+                            "conn=%s route=world unknown protocol=%s account=%s",
+                            getattr(state, "conn_id", 0),
+                            protocol,
+                            account,
+                        )
+                    else:
+                        LOGGER.warning(
+                            "conn=%s route=world account not found=%s",
+                            getattr(state, "conn_id", 0),
+                            account,
+                        )
+                    continue
+
+                raw_key = getattr(row, "session_key", None) or getattr(row, "sessionkey", None)
+                session_key_bytes = _coerce_bytes(raw_key)
+
+                if not session_key_bytes:
+                    LOGGER.warning(
+                        "conn=%s route=world invalid session key protocol=%s account=%s",
+                        getattr(state, "conn_id", 0),
+                        protocol,
                         account,
                     )
                     continue
 
-                crypto = _create_world_crypto(session_key_bytes)
+                # Initialize ARC4 crypto
+                crypto = _create_world_crypto(protocol, session_key_bytes)
+
                 state.session_key = session_key_bytes
                 state.world_crypto = crypto
                 state.encrypted = True
-                if getattr(state, "encrypted_world_stream", None) is None:
-                    state.encrypted_world_stream = EncryptedWorldStream()
 
-                for pending_direction in ("C", "S"):
-                    if state.packet_buffers[pending_direction]:
-                        state.packet_reparse_directions.add(pending_direction)
+                stream_adjust = int(SERVER_AUTH_RESPONSE_SIZE_ADJUST.get(protocol, 0))
+                if getattr(state, "encrypted_world_stream", None) is None:
+                    state.encrypted_world_stream = EncryptedWorldStream(
+                        server_auth_response_size_adjust=stream_adjust
+                    )
+                else:
+                    state.encrypted_world_stream.server_auth_response_size_adjust = stream_adjust
 
                 LOGGER.info(
-                    "conn=%s route=world world-crypto initialized protocol=%s account=%s",
+                    "conn=%s route=world world-crypto initialized protocol=%s account=%s key_len=%s",
                     getattr(state, "conn_id", 0),
-                    getattr(state, "protocol", PROTOCOL_UNKNOWN),
+                    protocol,
                     account,
+                    len(session_key_bytes),
                 )
+                if protocol == PROTOCOL_LEGACY:
+                    state.packet_reparse_directions.add("S")
+                    return []
+
+                state.packet_reparse_directions.update(("C", "S"))
+                return []
+
             except Exception as exc:
                 LOGGER.warning(
                     "conn=%s route=world failed to init crypto: %s",
                     getattr(state, "conn_id", 0),
                     exc,
                 )
-            break
+
+            break  # Only handle first AUTH_SESSION packet
 
         return packets
 
@@ -850,7 +1033,9 @@ class PacketCaptureAdapter:
 
 def configure_packet_adapters(state: Any, config: dict, route_name: str, route_phase_name: str) -> None:
     state.packet_parser = PacketParserAdapter(route_phase_name)
-    state.encrypted_world_stream = EncryptedWorldStream() if route_phase_name == "world" else None
+    state.encrypted_world_stream = (
+        EncryptedWorldStream(server_auth_response_size_adjust=0) if route_phase_name == "world" else None
+    )
     state.packet_adapters = [OpcodeResolverAdapter(route_phase_name)]
 
     state.packet_adapters.append(DslDecodeAdapter())

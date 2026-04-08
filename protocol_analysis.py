@@ -2,17 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Proxy-side protocol analysis for auth/world login packets.
+Proxy-side auth metadata extraction for auth/world login packets.
 
-This module is intentionally lightweight:
-- it reads DSL-decoded packet data
-- it classifies the connection as SRP6, LEGACY or UNKNOWN
-- it extracts semantic auth metadata without mutating DSL output
-
-SRP6 is identified by canonical SRP fields such as A, M1, B, g, N and s.
-Legacy is treated as any non-SRP auth flow with explicit credentials, hashes,
-digests or session-key-like fields. When a packet is ambiguous, the analyzer
-falls back to the configured world mode instead of guessing.
+The proxy must follow the configured world mode and not infer protocol from
+packet contents. This module only extracts semantic metadata such as username,
+stage and session key while protocol selection comes from proxy config.
 """
 
 from __future__ import annotations
@@ -25,10 +19,8 @@ PROTOCOL_UNKNOWN = "UNKNOWN"
 PROTOCOL_SRP6 = "SRP6"
 PROTOCOL_LEGACY = "LEGACY"
 
-_SRP_FIELDS = {"A", "M1", "B", "g", "N", "s", "M2"}
 _USERNAME_FIELDS = ("account", "username", "I")
 _SESSION_KEY_FIELDS = ("session_key", "sessionkey", "K")
-_CREDENTIAL_KEYWORDS = ("password", "hash", "digest", "proof", "session_key", "sessionkey")
 _STAGE_BY_OPCODE = {
     "AUTH_LOGON_CHALLENGE_C": "AUTH_CHALLENGE",
     "AUTH_LOGON_CHALLENGE_S": "AUTH_CHALLENGE",
@@ -86,50 +78,21 @@ def _extract_session_key(decoded: dict[str, Any]) -> bytes | None:
 def configured_protocol_hint(state: Any) -> str:
     proxy_cfg = getattr(state, "proxy", None)
     if not isinstance(proxy_cfg, dict):
-        return PROTOCOL_UNKNOWN
+        return PROTOCOL_SRP6
 
     route_name = getattr(state, "route_name", "")
     phase = getattr(state, "phase", "") or route_phase(route_name)
     scoped = scoped_proxy_config(proxy_cfg, phase=phase, route_name=route_name)
     world_mode = str((scoped.get("mode") or "")).strip().lower()
-    if world_mode == "srp6":
-        return PROTOCOL_SRP6
     if world_mode == "legacy":
         return PROTOCOL_LEGACY
-    return PROTOCOL_UNKNOWN
-
-
-def _has_legacy_credentials(decoded: dict[str, Any]) -> bool:
-    for key, value in decoded.items():
-        key_text = str(key).strip().lower()
-        if not key_text:
-            continue
-        if not any(token in key_text for token in _CREDENTIAL_KEYWORDS):
-            continue
-        if value in (None, "", b"", bytearray()):
-            continue
-        return True
-    return False
+    return PROTOCOL_SRP6
 
 
 def _detect_protocol(state: Any, opcode_name: str, decoded: dict[str, Any]) -> tuple[str, str]:
-    keys = set(decoded.keys())
-    if keys & _SRP_FIELDS:
-        return PROTOCOL_SRP6, "srp_fields"
-
-    if opcode_name == "CMSG_AUTH_SESSION" and {"account", "digest"} <= keys:
-        current = str(getattr(state, "protocol", PROTOCOL_UNKNOWN) or PROTOCOL_UNKNOWN).upper()
-        if current in {PROTOCOL_SRP6, PROTOCOL_LEGACY}:
-            return current, "session_continuation"
-        hint = configured_protocol_hint(state)
-        if hint != PROTOCOL_UNKNOWN:
-            return hint, "config_hint"
-        return PROTOCOL_UNKNOWN, ""
-
-    if _has_legacy_credentials(decoded):
-        return PROTOCOL_LEGACY, "legacy_credentials"
-
-    return PROTOCOL_UNKNOWN, ""
+    _ = opcode_name
+    _ = decoded
+    return configured_protocol_hint(state), "config"
 
 
 def analyze_packet(state: Any, packet_ctx: dict[str, Any]) -> dict[str, Any]:
@@ -160,11 +123,5 @@ def analyze_packet(state: Any, packet_ctx: dict[str, Any]) -> dict[str, Any]:
         "digest": decoded.get("digest"),
         "reason": reason,
     }
-
-    if result["auth_type"] == PROTOCOL_UNKNOWN:
-        hinted = configured_protocol_hint(state)
-        if hinted != PROTOCOL_UNKNOWN and opcode_name == "CMSG_AUTH_SESSION":
-            result["auth_type"] = hinted
-            result["reason"] = "config_hint"
 
     return result

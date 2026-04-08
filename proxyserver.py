@@ -28,10 +28,13 @@ from proxy.state import (
 )
 from proxy.state_machine import update_state
 from proxy.adapters import apply_adapters
-from proxy.packet_adapters import apply_packet_adapters, configure_packet_adapters
+from proxy.packet_adapters import (
+    apply_packet_adapters,
+    configure_packet_adapters,
+    reset_packet_adapter_runtime,
+)
 from proxy.telnet.server import run_telnet_server
 from proxy.utils.route_scope import route_phase, scoped_proxy_config
-from shared.ConfigLoader import ConfigLoader as SharedConfigLoader
 from shared.Logger import Logger
 
 
@@ -113,6 +116,10 @@ def _close_all_connections() -> None:
 
 
 def _sync_runtime_config() -> None:
+    global CONFIG
+    active_state = str(getattr(STATE, "active_state", "default") or "default")
+    ConfigLoader.install_shared_runtime_config(active_state)
+    CONFIG = ConfigLoader.load_active_config(active_state)
     CONFIG["routes"] = deepcopy(getattr(STATE, "routes", {}) or {})
     CONFIG["proxy"] = deepcopy(getattr(STATE, "proxy", {}) or {})
 
@@ -141,6 +148,7 @@ def _reload_runtime() -> None:
     STATE.reload_epoch = int(getattr(STATE, "reload_epoch", 0) or 0) + 1
     _close_all_connections()
     _close_all_listeners()
+    reset_packet_adapter_runtime()
     for thread in ROUTE_THREADS:
         thread.join(timeout=1.0)
     ROUTE_THREADS = _start_route_threads()
@@ -153,14 +161,6 @@ def _join_thread_quietly(thread: threading.Thread | None, timeout: float = 2.0) 
         thread.join(timeout=timeout)
     except RuntimeError:
         return
-
-
-def _project_name() -> str:
-    try:
-        cfg = SharedConfigLoader.load_config()
-    except Exception:
-        return "Unknown"
-    return str(cfg.get("project_name", "Unknown")).strip() or "Unknown"
 
 
 def _proxy_logging_cfg() -> dict:
@@ -209,52 +209,11 @@ signal.signal(signal.SIGINT, _handle_shutdown)
 signal.signal(signal.SIGTERM, _handle_shutdown)
 
 
-# ----------------------------------------------------------------------
-# Taps (state-aware)
-# ----------------------------------------------------------------------
-
-def log_tap(conn_id, client_addr, direction, data, state: SessionState):
-    client_ip, client_port = client_addr
-    LOGGER.info(
-        "conn=%s client=%s:%s phase=%s encrypted=%s %s raw=%s",
-        conn_id,
-        client_ip,
-        client_port,
-        state.phase,
-        state.encrypted,
-        direction,
-        _format_stream_raw(data, state.route_name, state.phase),
-    )
-
-
-def view_tap(conn_id, client_addr, direction, data, state):
-    LOGGER.info(
-        "conn=%s client=%s:%s phase=%s encrypted=%s %s raw=%s",
-        conn_id,
-        client_addr[0],
-        client_addr[1],
-        state.phase,
-        state.encrypted,
-        direction,
-        _format_stream_raw(data, state.route_name, state.phase),
-    )
-
-
 def build_taps(state: GlobalState, route_name: str, phase: str = ""):
-    proxy_cfg = _proxy_route_cfg(route_name, phase)
-    adapters_cfg = proxy_cfg.get("adapters") or {}
-    if adapters_cfg.get("opcode_parser", False) and adapters_cfg.get("logging", False):
-        return ()
-
-    taps = []
-
-    if state.enable_log:
-        taps.append(log_tap)
-
-    if state.enable_view:
-        taps.append(view_tap)
-
-    return tuple(taps)
+    _ = state
+    _ = route_name
+    _ = phase
+    return ()
 
 
 # ----------------------------------------------------------------------
@@ -271,22 +230,26 @@ def pipe(source, destination, conn_id, client_addr, direction, state):
             break
 
         update_state(state, data, direction)
-        apply_packet_adapters(state, data, direction)
         data = apply_adapters(state, data, direction)
 
         if not data:
             continue
+
+        try:
+            destination.sendall(data)
+        except OSError:
+            break
+
+        try:
+            apply_packet_adapters(state, data, direction)
+        except Exception as exc:
+            LOGGER.warning("packet-observer-error conn=%s: %s", conn_id, exc)
 
         for tap in build_taps(STATE, state.route_name, state.phase):
             try:
                 tap(conn_id, client_addr, direction, data, state)
             except Exception as exc:
                 LOGGER.error("tap error conn=%s: %s", conn_id, exc)
-
-        try:
-            destination.sendall(data)
-        except OSError:
-            break
 
 
 # ----------------------------------------------------------------------
@@ -437,18 +400,20 @@ def run_route(cfg, route, reload_epoch: int):
 
 def run():
     global CONFIG, ROUTE_THREADS, TELNET_THREAD, STATE
+    ConfigLoader.install_shared_runtime_config("default")
     CONFIG = ConfigLoader.load_active_config("default")
+    logging_cfg = CONFIG.get("logging", {}) or {}
 
     Logger.configure(
         scope="proxy",
-        write_to_log=bool(CONFIG.get("write_to_log", True)),
-        log_file=str(CONFIG.get("log_file", "proxy.log")),
+        write_to_log=bool(logging_cfg.get("write_to_log", True)),
+        log_file=str(logging_cfg.get("log_file", "proxy.log")),
         reset=True,
     )
-    LOGGER.info("%s Proxy starting", _project_name())
+    LOGGER.info("Proxy starting")
 
     STATE = load_state(DEFAULT_PROXY_STATE_PATH)
-    CONFIG = ConfigLoader.load_active_config(STATE.active_state)
+    LOGGER.info("proxy state active=%s", getattr(STATE, "active_state", "default"))
     _sync_runtime_config()
 
     ROUTE_THREADS = _start_route_threads()

@@ -44,6 +44,9 @@ _PROXY_SETTING_CHOICES = {
     "logging.raw_format": {"hex", "bytes"},
 }
 _PROXY_PHASES = {"auth", "world"}
+_STATE_FLAGS = {"enable_log", "enable_view", "enable_decode"}
+_STATE_DB_KEYS = {"auth_db", "world_db", "characters_db"}
+_STATE_MODE_CHOICES = {"legacy", "srp6"}
 _PROTOCOL_VIEW_TYPES = {"def", "debug", "json"}
 _ROUTE_SETTING_TYPES = {
     "listen": int,
@@ -80,7 +83,9 @@ def _runtime_state_snapshot(state) -> dict:
 
 
 def _proxy_log_file() -> str:
-    return str(DEFAULT_CONFIG.get("log_file", "proxy.log") or "proxy.log")
+    shared_cfg = DEFAULT_CONFIG.get("shared", {}) or {}
+    logging_cfg = shared_cfg.get("logging", {}) or {}
+    return str(logging_cfg.get("log_file", "proxy.log") or "proxy.log")
 
 
 def _persist_runtime_state(state) -> None:
@@ -90,6 +95,51 @@ def _persist_runtime_state(state) -> None:
 def _sync_default_config(config_data: dict) -> None:
     DEFAULT_CONFIG.clear()
     DEFAULT_CONFIG.update(config_data)
+
+
+def _load_proxy_config_json() -> dict:
+    try:
+        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"missing config file: {_CONFIG_PATH}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid json in {_CONFIG_PATH.name}: {exc}") from exc
+
+
+def _persist_proxy_config(config_data: dict) -> None:
+    _write_json(_CONFIG_PATH, config_data)
+    _sync_default_config(config_data)
+
+
+def _state_entries(config_data: dict) -> dict:
+    states_cfg = config_data.setdefault("states", {})
+    if not isinstance(states_cfg, dict):
+        states_cfg = {}
+        config_data["states"] = states_cfg
+    return states_cfg
+
+
+def _state_name_or_error(raw: str) -> str:
+    name = str(raw or "").strip()
+    if not name:
+        raise ValueError("missing state name")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError("state name must use letters, digits, '_' or '-'")
+    return name
+
+
+def _active_state_entry_snapshot(state) -> dict:
+    active_name = _active_state_name(state)
+    active_entry = deepcopy(((DEFAULT_CONFIG.get("states", {}) or {}).get(active_name, {})) or {})
+    return ConfigLoader._merge_dicts(active_entry, _runtime_state_snapshot(state))
+
+
+def _configured_state_config(state_name: str) -> dict:
+    name = str(state_name or "").strip() or "default"
+    states_cfg = DEFAULT_CONFIG.get("states", {}) or {}
+    if name not in states_cfg:
+        raise KeyError(name)
+    return ConfigLoader.load_active_config(name)
 
 
 def _proxy_scope_and_path(args):
@@ -364,6 +414,9 @@ register_arg_type("route", accepts=_is_route)
 register_arg_type("proxy_scope", accepts=_is_proxy_scope)
 register_arg_type("route_name", accepts=_is_route_name)
 register_arg_type("state_name")
+register_arg_type("state_flag")
+register_arg_type("state_db_key")
+register_arg_type("state_mode")
 register_arg_type("proxy_setting")
 register_arg_type("proxy_value")
 register_arg_type("bool")
@@ -550,7 +603,12 @@ def cmd_state_list(state, args):
     if not states:
         return ["No states defined"]
 
-    return ["states:"] + [f" - {name}" for name in sorted(states)]
+    active = _active_state_name(state)
+    lines = ["states:"]
+    for name in sorted(states):
+        marker = " *" if name == active else ""
+        lines.append(f" - {name}{marker}")
+    return lines
 
 
 def cmd_state_use(state, args):
@@ -569,6 +627,7 @@ def cmd_state_use(state, args):
     state.proxy.clear()
     state.proxy.update(deepcopy(cfg.get("proxy", {})))
     state.active_state = name
+    ConfigLoader.install_shared_runtime_config(name)
 
     for key in ("enable_log", "enable_view", "enable_decode"):
         if key in cfg:
@@ -579,16 +638,230 @@ def cmd_state_use(state, args):
 
 
 def cmd_state_show(state, args):
+    if len(args) > 1:
+        return ["usage: state show [name]"]
+
+    show_name = _active_state_name(state) if not args else str(args[0]).strip()
+    try:
+        active_cfg = _configured_state_config(show_name)
+    except KeyError:
+        return [f"unknown state: {show_name}"]
+
+    db_cfg = active_cfg.get("database", {}) or {}
+    world_mode = str(
+        ((((active_cfg.get("proxy") or {}).get("phases") or {}).get("world") or {}).get("mode") or "srp6")
+    ).strip().lower()
     lines = [
+        f"state         = {show_name}",
         f"active_state  = {_active_state_name(state)}",
         f"shutdown     = {state.shutdown}",
+        f"world_mode   = {world_mode}",
+        f"auth_db      = {db_cfg.get('auth_db', '')}",
+        f"world_db     = {db_cfg.get('world_db', '')}",
+        f"characters_db= {db_cfg.get('characters_db', '')}",
     ]
 
-    for name in ("enable_log", "enable_view"):
-        if hasattr(state, name):
-            lines.append(f"{name:12} = {getattr(state, name)}")
+    if show_name == _active_state_name(state):
+        for name in ("enable_log", "enable_view", "enable_decode"):
+            if hasattr(state, name):
+                lines.append(f"{name:12} = {getattr(state, name)}")
+    else:
+        for name in ("enable_log", "enable_view", "enable_decode"):
+            lines.append(f"{name:12} = {bool(active_cfg.get(name, False))}")
 
     return lines
+
+
+def cmd_state_set(state, args):
+    if len(args) != 2:
+        return ["usage: state set <enable_log|enable_view|enable_decode> <on|off>"]
+
+    flag_name = str(args[0]).strip()
+    if flag_name not in _STATE_FLAGS:
+        return [f"unknown state flag: {flag_name}"]
+
+    try:
+        value = _parse_bool(args[1])
+    except Exception as exc:
+        return [f"invalid value for {flag_name}: {exc}"]
+
+    setattr(state, flag_name, value)
+
+    try:
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    state_name = _active_state_name(state)
+    state_cfg = deepcopy(_state_entries(config_data).get(state_name, {}))
+    state_cfg[flag_name] = value
+    _state_entries(config_data)[state_name] = state_cfg
+    _persist_proxy_config(config_data)
+    _persist_runtime_state(state)
+    return [f"{state_name} {flag_name} = {value}"]
+
+
+def cmd_state_db_show(state, args):
+    if len(args) > 1:
+        return ["usage: state db show [name]"]
+
+    show_name = _active_state_name(state) if not args else str(args[0]).strip()
+    try:
+        db_cfg = (_configured_state_config(show_name).get("database") or {})
+    except KeyError:
+        return [f"unknown state: {show_name}"]
+
+    return [
+        f"state db ({show_name}):",
+        f" - auth_db = {db_cfg.get('auth_db', '')}",
+        f" - world_db = {db_cfg.get('world_db', '')}",
+        f" - characters_db = {db_cfg.get('characters_db', '')}",
+    ]
+
+
+def cmd_state_db_set(state, args):
+    if len(args) < 2:
+        return ["usage: state db set <auth_db|world_db|characters_db> <value>"]
+
+    key = str(args[0]).strip()
+    if key not in _STATE_DB_KEYS:
+        return [f"unknown database key: {key}"]
+
+    value = str(" ".join(args[1:])).strip()
+    if not value:
+        return [f"missing value for {key}"]
+
+    try:
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    state_name = _active_state_name(state)
+    state_cfg = deepcopy(_state_entries(config_data).get(state_name, {}))
+    state_cfg.setdefault("database", {})[key] = value
+    _state_entries(config_data)[state_name] = state_cfg
+    _persist_proxy_config(config_data)
+    _persist_runtime_state(state)
+    return [f"{state_name} database.{key} = {value}", "run 'reload' to apply database changes"]
+
+
+def cmd_state_mode(state, args):
+    if len(args) != 1:
+        return ["usage: state mode <legacy|srp6>"]
+
+    mode = str(args[0]).strip().lower()
+    if mode not in _STATE_MODE_CHOICES:
+        return ["usage: state mode <legacy|srp6>"]
+
+    state.proxy.setdefault("phases", {}).setdefault("world", {})["mode"] = mode
+
+    try:
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    state_name = _active_state_name(state)
+    state_cfg = deepcopy(_state_entries(config_data).get(state_name, {}))
+    state_cfg.setdefault("proxy", {}).setdefault("phases", {}).setdefault("world", {})["mode"] = mode
+    _state_entries(config_data)[state_name] = state_cfg
+    _persist_proxy_config(config_data)
+    ConfigLoader.install_shared_runtime_config(state_name)
+    _persist_runtime_state(state)
+    return [f"{state_name} world mode = {mode}", "run 'reload' to apply protocol mode changes"]
+
+
+def cmd_state_create(state, args):
+    if len(args) != 1:
+        return ["usage: state create <name>"]
+
+    try:
+        name = _state_name_or_error(args[0])
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    states_cfg = _state_entries(config_data)
+    if name in states_cfg:
+        return [f"state already exists: {name}"]
+
+    states_cfg[name] = _active_state_entry_snapshot(state)
+    _persist_proxy_config(config_data)
+    return [f"created state '{name}' from '{_active_state_name(state)}'"]
+
+
+def cmd_state_clone(state, args):
+    if len(args) != 2:
+        return ["usage: state clone <source> <target>"]
+
+    try:
+        source = _state_name_or_error(args[0])
+        target = _state_name_or_error(args[1])
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    states_cfg = _state_entries(config_data)
+    if source not in states_cfg:
+        return [f"unknown state: {source}"]
+    if target in states_cfg:
+        return [f"state already exists: {target}"]
+
+    states_cfg[target] = deepcopy(states_cfg[source])
+    _persist_proxy_config(config_data)
+    return [f"cloned state '{source}' -> '{target}'"]
+
+
+def cmd_state_rename(state, args):
+    if len(args) != 2:
+        return ["usage: state rename <old> <new>"]
+
+    try:
+        old_name = _state_name_or_error(args[0])
+        new_name = _state_name_or_error(args[1])
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    if old_name == "default":
+        return ["cannot rename default state"]
+
+    states_cfg = _state_entries(config_data)
+    if old_name not in states_cfg:
+        return [f"unknown state: {old_name}"]
+    if new_name in states_cfg:
+        return [f"state already exists: {new_name}"]
+
+    states_cfg[new_name] = states_cfg.pop(old_name)
+    _persist_proxy_config(config_data)
+    if _active_state_name(state) == old_name:
+        state.active_state = new_name
+        ConfigLoader.install_shared_runtime_config(new_name)
+        _persist_runtime_state(state)
+    return [f"renamed state '{old_name}' -> '{new_name}'"]
+
+
+def cmd_state_rm(state, args):
+    if len(args) != 1:
+        return ["usage: state rm <name>"]
+
+    try:
+        name = _state_name_or_error(args[0])
+        config_data = _load_proxy_config_json()
+    except Exception as exc:
+        return [str(exc)]
+
+    if name == "default":
+        return ["cannot remove default state"]
+    if _active_state_name(state) == name:
+        return [f"cannot remove active state: {name}"]
+
+    states_cfg = _state_entries(config_data)
+    if name not in states_cfg:
+        return [f"unknown state: {name}"]
+
+    states_cfg.pop(name, None)
+    _persist_proxy_config(config_data)
+    return [f"removed state '{name}'"]
 
 
 def cmd_default(state, args):
@@ -606,8 +879,17 @@ def cmd_status(state, args):
     if scope == "route" and not _route_exists(state, name):
         return [f"unknown route: {name}"]
 
+    active_cfg = _active_config(state)
+    db_cfg = active_cfg.get("database", {}) or {}
+    world_mode = str(
+        ((((active_cfg.get("proxy") or {}).get("phases") or {}).get("world") or {}).get("mode") or "srp6")
+    ).strip().lower()
     lines = [
         f"state         = {_active_state_name(state)}",
+        f"world_mode    = {world_mode}",
+        f"auth_db       = {db_cfg.get('auth_db', '')}",
+        f"world_db      = {db_cfg.get('world_db', '')}",
+        f"characters_db = {db_cfg.get('characters_db', '')}",
         f"routes        = {','.join(sorted(getattr(state, 'routes', {})))}",
     ]
 
@@ -771,7 +1053,13 @@ def cmd_save(state, args):
 
     states_cfg = config_data.setdefault("states", {})
     state_name = _active_state_name(state)
-    states_cfg[state_name] = _runtime_state_snapshot(state)
+    existing_state_cfg = states_cfg.get(state_name, {})
+    if not isinstance(existing_state_cfg, dict):
+        existing_state_cfg = {}
+    states_cfg[state_name] = ConfigLoader._merge_dicts(
+        existing_state_cfg,
+        _runtime_state_snapshot(state),
+    )
 
     _write_json(_CONFIG_PATH, config_data)
     _sync_default_config(config_data)
@@ -1187,6 +1475,14 @@ ROOT_COMMAND = CommandNode(
                     name="show",
                     handler=cmd_state_show,
                     help="Show current state",
+                    args=[
+                        ArgSpec(
+                            name="state",
+                            kind="state_name",
+                            optional=True,
+                            help="configured state name",
+                        )
+                    ],
                 ),
                 "use": CommandNode(
                     name="use",
@@ -1204,6 +1500,130 @@ ROOT_COMMAND = CommandNode(
                     name="list",
                     handler=cmd_state_list,
                     help="List available states",
+                ),
+                "set": CommandNode(
+                    name="set",
+                    handler=cmd_state_set,
+                    help="Set one runtime flag for the active state",
+                    args=[
+                        ArgSpec(
+                            name="flag",
+                            kind="state_flag",
+                            help="enable_log | enable_view | enable_decode",
+                        ),
+                        ArgSpec(
+                            name="value",
+                            kind="bool",
+                            help="on | off",
+                        ),
+                    ],
+                ),
+                "mode": CommandNode(
+                    name="mode",
+                    handler=cmd_state_mode,
+                    help="Set world protocol mode for the active state",
+                    args=[
+                        ArgSpec(
+                            name="mode",
+                            kind="state_mode",
+                            help="legacy | srp6",
+                        )
+                    ],
+                ),
+                "create": CommandNode(
+                    name="create",
+                    handler=cmd_state_create,
+                    help="Create a new state from the current active runtime state",
+                    args=[
+                        ArgSpec(
+                            name="state",
+                            kind="state_name",
+                            help="new state name",
+                        )
+                    ],
+                ),
+                "clone": CommandNode(
+                    name="clone",
+                    handler=cmd_state_clone,
+                    help="Clone one configured state into a new state",
+                    args=[
+                        ArgSpec(
+                            name="source",
+                            kind="state_name",
+                            help="existing state name",
+                        ),
+                        ArgSpec(
+                            name="target",
+                            kind="state_name",
+                            help="new state name",
+                        ),
+                    ],
+                ),
+                "rename": CommandNode(
+                    name="rename",
+                    handler=cmd_state_rename,
+                    help="Rename a configured state",
+                    args=[
+                        ArgSpec(
+                            name="old_state",
+                            kind="state_name",
+                            help="existing state name",
+                        ),
+                        ArgSpec(
+                            name="new_state",
+                            kind="state_name",
+                            help="new state name",
+                        ),
+                    ],
+                ),
+                "rm": CommandNode(
+                    name="rm",
+                    handler=cmd_state_rm,
+                    help="Remove a configured state",
+                    args=[
+                        ArgSpec(
+                            name="state",
+                            kind="state_name",
+                            help="configured state name",
+                        )
+                    ],
+                ),
+                "db": CommandNode(
+                    name="db",
+                    help="Inspect or modify active state database overrides",
+                    children={
+                        "show": CommandNode(
+                            name="show",
+                            handler=cmd_state_db_show,
+                            help="Show active state database names",
+                            args=[
+                                ArgSpec(
+                                    name="state",
+                                    kind="state_name",
+                                    optional=True,
+                                    help="configured state name",
+                                )
+                            ],
+                        ),
+                        "set": CommandNode(
+                            name="set",
+                            handler=cmd_state_db_set,
+                            help="Set one database name for the active state",
+                            args=[
+                                ArgSpec(
+                                    name="key",
+                                    kind="state_db_key",
+                                    help="auth_db | world_db | characters_db",
+                                ),
+                                ArgSpec(
+                                    name="value",
+                                    kind="proxy_value",
+                                    help="database name",
+                                    remainder=True,
+                                ),
+                            ],
+                        ),
+                    },
                 ),
             },
         ),
