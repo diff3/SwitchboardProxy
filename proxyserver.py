@@ -16,6 +16,7 @@ import socket
 import threading
 import itertools
 import signal
+import time
 from copy import deepcopy
 
 from proxy.utils.config_loader import ConfigLoader
@@ -58,6 +59,10 @@ CONNECTION_ID_LOCK = threading.Lock()
 CONNECTION_IDS = itertools.count(1)
 
 SOCKET_TIMEOUT = 300  # seconds
+
+CONNECTIONS = {}
+CONNECTIONS_LOCK = threading.Lock()
+
 
 STATE = GlobalState()
 
@@ -229,6 +234,10 @@ def pipe(source, destination, conn_id, client_addr, direction, state):
         except OSError:
             break
 
+        if not data:
+            LOGGER.info(f"[PROXY] conn={conn_id} remote closed ({direction})")
+            break
+
         update_state(state, data, direction)
         data = apply_adapters(state, data, direction)
 
@@ -398,6 +407,41 @@ def run_route(cfg, route, reload_epoch: int):
 # Entry point
 # ----------------------------------------------------------------------
 
+def _cleanup_dead_connections():
+    now = time.time()
+
+    connections = getattr(STATE, "connections", None)
+    if not connections:
+        return  # inget att göra
+
+    # kopiera först (undvik mutation under iteration)
+    conns = list(connections.items())
+
+    for conn_id, conn in conns:
+        last = float(getattr(conn, "last_activity", 0) or 0)
+        age = now - last
+
+        # skip helt nya / oinitierade
+        if last <= 0:
+            continue
+
+        if age > 60:
+            Logger.warning(
+                f"[PROXY TIMEOUT] closing conn={conn_id} age={age:.1f}"
+            )
+
+            try:
+                conn.close()
+            except Exception as exc:
+                Logger.debug(f"[PROXY TIMEOUT] close failed: {exc}")
+
+            # säker borttagning
+            try:
+                connections.pop(conn_id, None)
+            except Exception as exc:
+                Logger.debug(f"[PROXY TIMEOUT] pop failed: {exc}")
+
+
 def run():
     global CONFIG, ROUTE_THREADS, TELNET_THREAD, STATE
     ConfigLoader.install_shared_runtime_config("default")
@@ -435,6 +479,8 @@ def run():
         while not SHUTDOWN_EVENT.wait(0.2):
             if STATE.reload_requested:
                 _reload_runtime()
+
+            _cleanup_dead_connections()
     finally:
         _close_all_connections()
         _close_all_listeners()
